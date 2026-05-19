@@ -168,3 +168,34 @@ def test_create_and_patch_call_index(_no_palace):
     assert len(_no_palace) == 1
     ss.patch_skill("ix", old_string="b", new_string="c")
     assert len(_no_palace) == 2
+
+
+def test_exec_tool_skill_manage_and_view(monkeypatch):
+    # HOME was already redirected to _TMP_HOME at module top, before any import,
+    # so importing app here picks up the tmp paths. No reload (reloading app.py
+    # re-runs its module-level app.mount/config.init side effects).
+    sys.path.insert(0, os.path.join(_REPO_ROOT, "mempalace-src"))
+    import app as app_module  # noqa: E402
+    monkeypatch.setattr("skill_store.index_skill", lambda n, d, p: None)
+
+    created = app_module._exec_tool(
+        "skill_manage",
+        {"action": "create", "name": "t1", "description": "d",
+         "body": "## When to use\nx\n", "category": "ops"},
+        "personal", None,
+    )
+    assert created["ok"] is True and created["name"] == "t1"
+
+    viewed = app_module._exec_tool("skill_view", {"name": "t1"}, "personal", None)
+    assert "When to use" in viewed["body"]
+
+    patched = app_module._exec_tool(
+        "skill_manage",
+        {"action": "patch", "name": "t1",
+         "old_string": "x", "new_string": "y"},
+        "personal", None,
+    )
+    assert patched["ok"] is True
+    assert app_module._exec_tool(
+        "skill_manage", {"action": "bogus", "name": "t1"}, "personal", None
+    ).get("error")

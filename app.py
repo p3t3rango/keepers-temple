@@ -47,6 +47,7 @@ from mempalace.palace import get_collection
 from mempalace.searcher import search_memories
 
 import mcp_client
+import skill_store
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_ROOM = "general"
@@ -1721,6 +1722,69 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_view",
+            "description": (
+                "Read the full body of a saved skill by name. Call this when a "
+                "skill in <available_skills> looks relevant before acting."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "file_path": {
+                        "type": "string",
+                        "description": "Optional support file inside the skill dir.",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_manage",
+            "description": (
+                "Create or improve a reusable skill (a written procedure you can "
+                "follow later). action='create' for a new skill; action='patch' "
+                "to fix/extend an existing one (token-efficient substring edit). "
+                "Prefer patching an existing skill over creating a near-duplicate. "
+                "Structure the body with these sections: '## Contract' (what it "
+                "guarantees), '## Phases' (numbered steps), '## Anti-Patterns' "
+                "(what to avoid), '## Output Format' (expected result)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["create", "patch"]},
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "body": {"type": "string"},
+                    "category": {"type": "string"},
+                    "triggers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Phrases that should surface this skill.",
+                    },
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Allow-list of tools this skill may drive.",
+                    },
+                    "mutating": {
+                        "type": "boolean",
+                        "description": "True if following the skill changes state.",
+                    },
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                },
+                "required": ["action", "name"],
+            },
+        },
+    },
 ]
 
 TOOL_PROTOCOL = (
@@ -1832,6 +1896,47 @@ def _exec_tool(
                 entry,
                 topic=str(args.get("topic") or "general"),
             )
+        if name == "skill_view":
+            try:
+                sk = skill_store.get_skill(str(args.get("name") or ""))
+            except skill_store.SkillError as e:
+                return {"error": str(e)}
+            if args.get("file_path"):
+                d = skill_store._skill_dir(sk["name"])
+                fp = (d / str(args["file_path"])) if d else None
+                if not fp or not fp.exists():
+                    return {"error": f"file not found: {args['file_path']}"}
+                return {"name": sk["name"], "file": str(args["file_path"]),
+                        "body": fp.read_text()}
+            return {"name": sk["name"], "description": sk["description"],
+                    "body": sk["body"], "state": sk["state"]}
+        if name == "skill_manage":
+            action = str(args.get("action") or "").strip()
+            try:
+                if action == "create":
+                    r = skill_store.create_skill(
+                        name=str(args.get("name") or ""),
+                        description=str(args.get("description") or ""),
+                        body=str(args.get("body") or ""),
+                        category=str(args.get("category") or "general"),
+                        agent_created=bool(args.get("agent_created", False)),
+                        triggers=args.get("triggers") or [],
+                        tools=args.get("tools") or [],
+                        mutating=bool(args.get("mutating", False)),
+                    )
+                    return {"ok": True, "name": r["name"], "action": "create"}
+                if action == "patch":
+                    r = skill_store.patch_skill(
+                        name=str(args.get("name") or ""),
+                        old_string=str(args.get("old_string") or ""),
+                        new_string=str(args.get("new_string") or ""),
+                        file_path=args.get("file_path"),
+                        replace_all=bool(args.get("replace_all", False)),
+                    )
+                    return {"ok": True, "name": r["name"], "action": "patch"}
+                return {"error": f"unknown skill_manage action: {action}"}
+            except skill_store.SkillError as e:
+                return {"error": str(e)}
         return {"error": f"unknown tool: {name}"}
     except Exception as e:
         return {"error": str(e)}
