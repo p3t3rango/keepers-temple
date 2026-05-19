@@ -1,0 +1,685 @@
+=== NEW FILE: mempalace-src/mempalace/pending_store.py ===
+"""
+pending_store.py — Staging layer for import-time review gate.
+
+When `mempalace mine --mode convos --extract general --review` runs, classified
+inferences are written here instead of ChromaDB. Users accept/edit/reject them
+via the Keepers Temple /review page; ambiguous cases produce questions answered
+via the /questions page.
+
+Runtime chat saves and the default (verbatim) mining path bypass this module.
+"""
+
+import json
+import os
+import sqlite3
+import threading
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional
+
+
+DEFAULT_PENDING_PATH = os.path.expanduser("~/.mempalace/pending.sqlite3")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _new_id() -> str:
+    return uuid.uuid4().hex
+
+
+class PendingStore:
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = db_path or DEFAULT_PENDING_PATH
+        db_parent = Path(self.db_path).parent
+        db_parent.mkdir(parents=True, exist_ok=True)
+        try:
+            db_parent.chmod(0o700)
+        except (OSError, NotImplementedError):
+            pass
+        self._connection = None
+        self._lock = threading.Lock()
+        self._init_db()
+
+    def _init_db(self):
+        conn = self._conn()
+        conn.executescript("""
+            PRAGMA journal_mode=WAL;
+
+            CREATE TABLE IF NOT EXISTS drawers_pending (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                proposed_wing TEXT NOT NULL,
+                proposed_room TEXT NOT NULL,
+                memory_type TEXT,
+                keyword_score REAL,
+                source_conversation TEXT,
+                source_snippet TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                resolved_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS questions_pending (
+                id TEXT PRIMARY KEY,
+                question TEXT NOT NULL,
+                context TEXT,
+                proposed_answers TEXT,
+                blocks_pending_ids TEXT,
+                source_conversation TEXT,
+                status TEXT DEFAULT 'open',
+                answer TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                answered_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pending_status ON drawers_pending(status);
+            CREATE INDEX IF NOT EXISTS idx_pending_source ON drawers_pending(source_conversation);
+            CREATE INDEX IF NOT EXISTS idx_questions_status ON questions_pending(status);
+        """)
+        conn.commit()
+
+    def _conn(self):
+        if self._connection is None:
+            self._connection = sqlite3.connect(
+                self.db_path, timeout=10, check_same_thread=False
+            )
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._connection.row_factory = sqlite3.Row
+        return self._connection
+
+    def close(self):
+        with self._lock:
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
+
+    # ── Write: drawers ────────────────────────────────────────────────────
+
+    def add_pending_drawer(
+        self,
+        content: str,
+        proposed_wing: str,
+        proposed_room: str,
+        memory_type: Optional[str] = None,
+        keyword_score: Optional[float] = None,
+        source_conversation: Optional[str] = None,
+        source_snippet: Optional[str] = None,
+    ) -> str:
+        drawer_id = _new_id()
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                conn.execute(
+                    """INSERT INTO drawers_pending
+                    (id, content, proposed_wing, proposed_room, memory_type,
+                     keyword_score, source_conversation, source_snippet, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                    (
+                        drawer_id,
+                        content,
+                        proposed_wing,
+                        proposed_room,
+                        memory_type,
+                        keyword_score,
+                        source_conversation,
+                        source_snippet,
+                        _now(),
+                    ),
+                )
+        return drawer_id
+
+    # ── Write: questions ──────────────────────────────────────────────────
+
+    def add_pending_question(
+        self,
+        question: str,
+        context: Optional[str] = None,
+        proposed_answers: Optional[List[str]] = None,
+        blocks_pending_ids: Optional[List[str]] = None,
+        source_conversation: Optional[str] = None,
+    ) -> str:
+        qid = _new_id()
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                conn.execute(
+                    """INSERT INTO questions_pending
+                    (id, question, context, proposed_answers, blocks_pending_ids,
+                     source_conversation, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'open', ?)""",
+                    (
+                        qid,
+                        question,
+                        context,
+                        json.dumps(proposed_answers or []),
+                        json.dumps(blocks_pending_ids or []),
+                        source_conversation,
+                        _now(),
+                    ),
+                )
+        return qid
+
+    # ── Read ──────────────────────────────────────────────────────────────
+
+    def list_pending(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        source: Optional[str] = None,
+    ) -> List[Dict]:
+        q = "SELECT * FROM drawers_pending WHERE status = 'pending'"
+        params: List = []
+        if source:
+            q += " AND source_conversation = ?"
+            params.append(source)
+        q += " ORDER BY keyword_score DESC, created_at ASC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_pending(self, source: Optional[str] = None) -> int:
+        q = "SELECT COUNT(*) AS n FROM drawers_pending WHERE status = 'pending'"
+        params: List = []
+        if source:
+            q += " AND source_conversation = ?"
+            params.append(source)
+        with self._lock:
+            conn = self._conn()
+            row = conn.execute(q, params).fetchone()
+        return int(row["n"])
+
+    def get_pending(self, drawer_id: str) -> Optional[Dict]:
+        with self._lock:
+            conn = self._conn()
+            row = conn.execute(
+                "SELECT * FROM drawers_pending WHERE id = ?", (drawer_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_questions(self) -> List[Dict]:
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute(
+                """SELECT *,
+                       LENGTH(blocks_pending_ids) - LENGTH(REPLACE(blocks_pending_ids, ',', ''))
+                       AS block_count_approx
+                   FROM questions_pending
+                   WHERE status = 'open'
+                   ORDER BY block_count_approx DESC, created_at ASC"""
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["proposed_answers"] = json.loads(d.get("proposed_answers") or "[]")
+            d["blocks_pending_ids"] = json.loads(d.get("blocks_pending_ids") or "[]")
+            out.append(d)
+        return out
+
+    def count_questions(self) -> int:
+        with self._lock:
+            conn = self._conn()
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM questions_pending WHERE status = 'open'"
+            ).fetchone()
+        return int(row["n"])
+
+    def get_question(self, qid: str) -> Optional[Dict]:
+        with self._lock:
+            conn = self._conn()
+            row = conn.execute(
+                "SELECT * FROM questions_pending WHERE id = ?", (qid,)
+            ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["proposed_answers"] = json.loads(d.get("proposed_answers") or "[]")
+        d["blocks_pending_ids"] = json.loads(d.get("blocks_pending_ids") or "[]")
+        return d
+
+    def list_pending_sources(self) -> List[Dict]:
+        """Conversation buckets with pending counts for grouped UI view."""
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute(
+                """SELECT source_conversation AS source, COUNT(*) AS n
+                   FROM drawers_pending
+                   WHERE status = 'pending'
+                   GROUP BY source_conversation
+                   ORDER BY n DESC"""
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Write: resolve drawers ────────────────────────────────────────────
+
+    def apply_edits(
+        self,
+        drawer_id: str,
+        content: Optional[str] = None,
+        wing: Optional[str] = None,
+        room: Optional[str] = None,
+    ) -> None:
+        sets = []
+        params: List = []
+        if content is not None:
+            sets.append("content = ?")
+            params.append(content)
+        if wing is not None:
+            sets.append("proposed_wing = ?")
+            params.append(wing)
+        if room is not None:
+            sets.append("proposed_room = ?")
+            params.append(room)
+        if not sets:
+            return
+        params.append(drawer_id)
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                conn.execute(
+                    f"UPDATE drawers_pending SET {', '.join(sets)} WHERE id = ?",
+                    params,
+                )
+
+    def mark_approved(self, drawer_id: str) -> None:
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                conn.execute(
+                    "UPDATE drawers_pending SET status = 'approved', resolved_at = ? WHERE id = ?",
+                    (_now(), drawer_id),
+                )
+
+    def mark_rejected(self, drawer_id: str) -> None:
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                conn.execute(
+                    "UPDATE drawers_pending SET status = 'rejected', resolved_at = ? WHERE id = ?",
+                    (_now(), drawer_id),
+                )
+
+    def ids_for_source(
+        self, source: str, status: str = "pending"
+    ) -> List[str]:
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute(
+                "SELECT id FROM drawers_pending WHERE source_conversation = ? AND status = ?",
+                (source, status),
+            ).fetchall()
+        return [r["id"] for r in rows]
+
+    # ── Write: resolve questions ──────────────────────────────────────────
+
+    def mark_question_answered(self, qid: str, answer: str) -> None:
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                conn.execute(
+                    """UPDATE questions_pending
+                       SET status = 'answered', answer = ?, answered_at = ?
+                       WHERE id = ?""",
+                    (answer, _now(), qid),
+                )
+
+    def mark_question_skipped(self, qid: str) -> None:
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                conn.execute(
+                    """UPDATE questions_pending
+                       SET status = 'skipped', answered_at = ?
+                       WHERE id = ?""",
+                    (_now(), qid),
+                )
+
+    # ── Stats ─────────────────────────────────────────────────────────────
+
+    def stats(self) -> Dict[str, int]:
+        with self._lock:
+            conn = self._conn()
+            drawers = conn.execute(
+                """SELECT status, COUNT(*) AS n FROM drawers_pending GROUP BY status"""
+            ).fetchall()
+            questions = conn.execute(
+                """SELECT status, COUNT(*) AS n FROM questions_pending GROUP BY status"""
+            ).fetchall()
+        return {
+            "drawers_" + r["status"]: int(r["n"]) for r in drawers
+        } | {"questions_" + r["status"]: int(r["n"]) for r in questions}
+
+=== NEW FILE: mempalace-src/tests/test_pending_store.py ===
+"""Tests for the import-time review gate's SQLite staging store."""
+
+import os
+import tempfile
+
+import pytest
+
+from mempalace.pending_store import PendingStore
+
+
+@pytest.fixture
+def store():
+    with tempfile.TemporaryDirectory() as d:
+        yield PendingStore(os.path.join(d, "pending.sqlite3"))
+
+
+def test_add_and_list_pending_drawer(store):
+    pid = store.add_pending_drawer(
+        content="User prefers tabs over spaces",
+        proposed_wing="personal",
+        proposed_room="preferences",
+        memory_type="preference",
+        keyword_score=4.0,
+        source_conversation="chat_a.json",
+    )
+    assert pid
+    pending = store.list_pending()
+    assert len(pending) == 1
+    assert pending[0]["id"] == pid
+    assert pending[0]["status"] == "pending"
+    assert pending[0]["proposed_wing"] == "personal"
+    assert store.count_pending() == 1
+    assert store.count_pending(source="chat_a.json") == 1
+    assert store.count_pending(source="other.json") == 0
+
+
+def test_review_order_sorts_by_keyword_score_desc(store):
+    low = store.add_pending_drawer(
+        content="low", proposed_wing="w", proposed_room="r", keyword_score=1.0,
+        source_conversation="a.json",
+    )
+    high = store.add_pending_drawer(
+        content="high", proposed_wing="w", proposed_room="r", keyword_score=5.0,
+        source_conversation="a.json",
+    )
+    ids = [r["id"] for r in store.list_pending()]
+    assert ids == [high, low]
+
+
+def test_apply_edits_updates_wing_room_content(store):
+    pid = store.add_pending_drawer(
+        content="original", proposed_wing="personal", proposed_room="general",
+        source_conversation="x.json",
+    )
+    store.apply_edits(pid, wing="work", room="planning", content="edited")
+    item = store.get_pending(pid)
+    assert item["proposed_wing"] == "work"
+    assert item["proposed_room"] == "planning"
+    assert item["content"] == "edited"
+    assert item["status"] == "pending"
+
+
+def test_mark_approved_and_rejected_remove_from_pending_list(store):
+    pid_a = store.add_pending_drawer(
+        content="a", proposed_wing="w", proposed_room="r",
+        source_conversation="f.json",
+    )
+    pid_b = store.add_pending_drawer(
+        content="b", proposed_wing="w", proposed_room="r",
+        source_conversation="f.json",
+    )
+    store.mark_approved(pid_a)
+    store.mark_rejected(pid_b)
+    assert store.count_pending() == 0
+    assert store.get_pending(pid_a)["status"] == "approved"
+    assert store.get_pending(pid_a)["resolved_at"] is not None
+    assert store.get_pending(pid_b)["status"] == "rejected"
+
+
+def test_ids_for_source_filters_by_status(store):
+    pid = store.add_pending_drawer(
+        content="a", proposed_wing="w", proposed_room="r",
+        source_conversation="src.json",
+    )
+    store.add_pending_drawer(
+        content="b", proposed_wing="w", proposed_room="r",
+        source_conversation="other.json",
+    )
+    assert store.ids_for_source("src.json") == [pid]
+    store.mark_approved(pid)
+    assert store.ids_for_source("src.json") == []
+    assert store.ids_for_source("src.json", status="approved") == [pid]
+
+
+def test_list_pending_sources_groups_by_conversation(store):
+    for src, n in [("a.json", 3), ("b.json", 1), ("c.json", 2)]:
+        for _ in range(n):
+            store.add_pending_drawer(
+                content="x", proposed_wing="w", proposed_room="r",
+                source_conversation=src,
+            )
+    sources = {s["source"]: s["n"] for s in store.list_pending_sources()}
+    assert sources == {"a.json": 3, "b.json": 1, "c.json": 2}
+
+
+def test_question_roundtrip(store):
+    pid = store.add_pending_drawer(
+        content="Kai suggested using Postgres",
+        proposed_wing="work", proposed_room="decisions",
+        source_conversation="chat_b.json",
+    )
+    qid = store.add_pending_question(
+        question="Which Kai?",
+        context="Kai suggested Postgres",
+        proposed_answers=["Same as wing_kai", "Different person"],
+        blocks_pending_ids=[pid],
+        source_conversation="chat_b.json",
+    )
+    open_questions = store.list_questions()
+    assert len(open_questions) == 1
+    q = open_questions[0]
+    assert q["id"] == qid
+    assert q["proposed_answers"] == ["Same as wing_kai", "Different person"]
+    assert q["blocks_pending_ids"] == [pid]
+
+    store.mark_question_answered(qid, "Same as wing_kai")
+    assert store.count_questions() == 0
+    answered = store.get_question(qid)
+    assert answered["status"] == "answered"
+    assert answered["answer"] == "Same as wing_kai"
+
+
+def test_question_skip(store):
+    qid = store.add_pending_question(
+        question="Foo?",
+        proposed_answers=["yes", "no"],
+        source_conversation="c.json",
+    )
+    store.mark_question_skipped(qid)
+    assert store.count_questions() == 0
+    assert store.get_question(qid)["status"] == "skipped"
+
+
+def test_stats_reports_counts_by_status(store):
+    pid = store.add_pending_drawer(
+        content="a", proposed_wing="w", proposed_room="r",
+        source_conversation="s.json",
+    )
+    store.add_pending_drawer(
+        content="b", proposed_wing="w", proposed_room="r",
+        source_conversation="s.json",
+    )
+    store.mark_approved(pid)
+    stats = store.stats()
+    assert stats.get("drawers_pending") == 1
+    assert stats.get("drawers_approved") == 1
+
+=== NEW FILE: mempalace-src/tests/test_convo_miner_review.py ===
+"""Tests for the review-gate integration in convo_miner.mine_convos."""
+
+import os
+import shutil
+import tempfile
+
+import chromadb
+
+from mempalace.convo_miner import mine_convos
+from mempalace.pending_store import PendingStore
+
+
+# Enough decision-marker density that general_extractor emits at least one chunk.
+_INFERENCE_TEXT = (
+    "We decided to migrate auth to Clerk because the old middleware was flagged "
+    "for compliance issues. The final choice locked in after reviewing Auth0 "
+    "and Descope. This decision means the team will adopt Clerk going forward "
+    "and all new projects should use the Clerk SDK. We committed to this path "
+    "after weighing the trade-offs across the three providers."
+)
+
+
+def _write(tmpdir: str, name: str, body: str) -> str:
+    p = os.path.join(tmpdir, name)
+    with open(p, "w") as f:
+        f.write(body)
+    return p
+
+
+def test_review_mode_routes_general_extractions_to_pending_store(tmp_path, monkeypatch):
+    """When review=True + extract_mode=general, inferences land in pending, not Chroma."""
+    pending_db = tmp_path / "pending.sqlite3"
+    # Redirect the pending store HOME so PendingStore() writes to tmp.
+    monkeypatch.setattr(
+        "mempalace.pending_store.DEFAULT_PENDING_PATH", str(pending_db)
+    )
+    # Also redirect KG so the entity-conflict pass runs against an empty KG.
+    monkeypatch.setattr(
+        "mempalace.knowledge_graph.DEFAULT_KG_PATH",
+        str(tmp_path / "kg.sqlite3"),
+    )
+
+    convo_dir = tempfile.mkdtemp()
+    palace_path = os.path.join(convo_dir, "palace")
+    try:
+        _write(convo_dir, "import.txt", _INFERENCE_TEXT)
+
+        stats = mine_convos(
+            convo_dir,
+            palace_path,
+            wing="test_wing",
+            extract_mode="general",
+            review=True,
+        )
+
+        # Inferred chunks did NOT commit to ChromaDB.
+        assert stats["committed"] == 0
+        assert stats["pending"] >= 1
+
+        # ChromaDB collection is empty (aside from the sentinel for file_already_mined).
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        docs = col.get()["documents"]
+        non_sentinel = [d for d in docs if d and d.strip()]
+        # Sentinels may contain empty strings; pending inferences shouldn't appear.
+        for d in non_sentinel:
+            assert "Clerk" not in d, "inference leaked into ChromaDB"
+
+        # Pending store has the items, tagged to the right source file.
+        store = PendingStore(str(pending_db))
+        items = store.list_pending()
+        assert len(items) == stats["pending"]
+        for it in items:
+            assert it["source_conversation"] == "import.txt"
+            assert it["proposed_wing"] == "test_wing"
+            assert it["status"] == "pending"
+    finally:
+        shutil.rmtree(convo_dir, ignore_errors=True)
+
+
+def test_default_mode_bypasses_gate_even_when_review_true(tmp_path, monkeypatch):
+    """Verbatim chunk_exchanges output always auto-commits; review flag is irrelevant."""
+    monkeypatch.setattr(
+        "mempalace.pending_store.DEFAULT_PENDING_PATH",
+        str(tmp_path / "pending.sqlite3"),
+    )
+    monkeypatch.setattr(
+        "mempalace.knowledge_graph.DEFAULT_KG_PATH",
+        str(tmp_path / "kg.sqlite3"),
+    )
+
+    convo_dir = tempfile.mkdtemp()
+    palace_path = os.path.join(convo_dir, "palace")
+    try:
+        _write(
+            convo_dir,
+            "chat.txt",
+            "> What is memory?\nMemory is persistence.\n\n"
+            "> Why does it matter?\nIt enables continuity.\n\n"
+            "> How do we build it?\nWith structured storage.\n",
+        )
+
+        stats = mine_convos(
+            convo_dir,
+            palace_path,
+            wing="verbatim_wing",
+            extract_mode="exchange",
+            review=True,
+        )
+
+        assert stats["committed"] >= 1
+        assert stats["pending"] == 0
+
+        store = PendingStore(str(tmp_path / "pending.sqlite3"))
+        assert store.count_pending() == 0
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        metas = col.get()["metadatas"]
+        auto_tagged = [m for m in metas if m and m.get("origin") == "import_auto"]
+        assert len(auto_tagged) >= 1, "verbatim drawers should be tagged origin:import_auto"
+        assert any(m.get("source_conversation") == "chat.txt" for m in auto_tagged)
+    finally:
+        shutil.rmtree(convo_dir, ignore_errors=True)
+
+
+def test_entity_conflict_produces_question(tmp_path, monkeypatch):
+    """When an imported chunk mentions an existing KG entity by name, emit a question."""
+    monkeypatch.setattr(
+        "mempalace.pending_store.DEFAULT_PENDING_PATH",
+        str(tmp_path / "pending.sqlite3"),
+    )
+    monkeypatch.setattr(
+        "mempalace.knowledge_graph.DEFAULT_KG_PATH",
+        str(tmp_path / "kg.sqlite3"),
+    )
+
+    # Seed the KG with an existing Kai entity.
+    from mempalace.knowledge_graph import KnowledgeGraph
+    kg = KnowledgeGraph(str(tmp_path / "kg.sqlite3"))
+    kg.add_entity("Kai", entity_type="person")
+    kg.close()
+
+    convo_dir = tempfile.mkdtemp()
+    palace_path = os.path.join(convo_dir, "palace")
+    try:
+        _write(
+            convo_dir,
+            "chat.txt",
+            "We decided to adopt Clerk for auth. Kai committed to reviewing "
+            "the rollout plan by Friday. The team finalised the decision after "
+            "a long debate, and Kai is now the owner of the auth migration work. "
+            "This is a locked-in choice — no more discussion.",
+        )
+
+        mine_convos(
+            convo_dir,
+            palace_path,
+            wing="test_wing",
+            extract_mode="general",
+            review=True,
+        )
+
+        store = PendingStore(str(tmp_path / "pending.sqlite3"))
+        questions = store.list_questions()
+        assert any("Kai" in q["question"] for q in questions), (
+            f"expected a question about Kai, got: {[q['question'] for q in questions]}"
+        )
+    finally:
+        shutil.rmtree(convo_dir, ignore_errors=True)

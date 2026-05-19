@@ -40,6 +40,7 @@ from mempalace.mcp_server import (
     tool_kg_timeline,
     tool_list_drawers,
     tool_list_tunnels,
+    tool_list_wings,
     tool_reconnect,
     tool_update_drawer,
 )
@@ -191,6 +192,8 @@ class TunnelCreateBody(BaseModel):
 class ConvoImportBody(BaseModel):
     path: str
     limit: Optional[int] = None
+    extract: Optional[str] = None  # "exchange" | "general"
+    review: bool = True            # gate --extract general output via review queue
 
 
 def _safe_collection():
@@ -928,6 +931,1086 @@ async def l2_recall_endpoint(
         return {"text": "", "tokens_estimate": 0, "error": str(e)}
 
 
+# ── Memories tab endpoints (consumer-facing unified view) ────────────────
+
+
+@app.get("/api/memories/topics")
+async def memories_topics():
+    """Topics (wings) with drawer counts. Used by the Memories filter."""
+    try:
+        result = tool_list_wings() or {}
+        wings = result.get("wings") if isinstance(result, dict) else None
+        if isinstance(wings, dict):
+            items = [
+                {"topic": str(k), "count": int(v)}
+                for k, v in wings.items()
+                if k and not str(k).startswith("_")
+            ]
+        else:
+            items = []
+        items.sort(key=lambda x: (-x["count"], x["topic"]))
+        return {"topics": items, "total": sum(i["count"] for i in items)}
+    except Exception as e:
+        return {"topics": [], "total": 0, "error": str(e)}
+
+
+@app.get("/api/memories/list")
+async def memories_list(
+    topic: Optional[str] = None,
+    section: Optional[str] = None,
+    limit: int = 30,
+    offset: int = 0,
+):
+    """List drawers with full metadata (including filed_at timestamp)."""
+    limit = max(1, min(int(limit), 200))
+    offset = max(0, int(offset))
+    col = _safe_collection()
+    if col is None:
+        return {"items": [], "total": 0}
+    try:
+        conditions = []
+        if topic:
+            conditions.append({"wing": topic})
+        if section:
+            conditions.append({"room": section})
+        # Exclude the internal "_registry" sentinel room used by convo_miner.
+        conditions.append({"room": {"$ne": "_registry"}})
+        where = conditions[0] if len(conditions) == 1 else {"$and": conditions}
+
+        # Fetch all matching (ChromaDB has no cheap count; we filter/paginate client side).
+        full = col.get(include=["documents", "metadatas"], where=where)
+        all_ids = full.get("ids") or []
+        all_docs = full.get("documents") or []
+        all_metas = full.get("metadatas") or []
+
+        combined = []
+        for i, did in enumerate(all_ids):
+            meta = all_metas[i] or {}
+            doc = all_docs[i] or ""
+            combined.append((did, doc, meta))
+
+        # Sort newest-first by filed_at.
+        combined.sort(
+            key=lambda t: str((t[2] or {}).get("filed_at") or ""),
+            reverse=True,
+        )
+        page = combined[offset : offset + limit]
+        items = []
+        for did, doc, meta in page:
+            items.append({
+                "drawer_id": did,
+                "wing": meta.get("wing", ""),
+                "room": meta.get("room", ""),
+                "content_preview": doc[:400] + ("…" if len(doc) > 400 else ""),
+                "filed_at": meta.get("filed_at"),
+                "added_by": meta.get("added_by"),
+                "source_file": meta.get("source_file"),
+                "origin": meta.get("origin"),
+            })
+        return {"items": items, "total": len(combined)}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/memories/search")
+async def memories_search_endpoint(
+    q: str,
+    topic: Optional[str] = None,
+    n: int = 15,
+):
+    q = q.strip()
+    if not q:
+        return {"items": [], "total": 0}
+    try:
+        result = search_memories(
+            q,
+            palace_path=PALACE_PATH,
+            wing=topic or None,
+            n_results=max(1, min(int(n), 50)),
+        )
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    hits = result.get("results") or []
+    return {
+        "items": [
+            {
+                "drawer_id": h.get("drawer_id") or h.get("id"),
+                "wing": h.get("wing"),
+                "room": h.get("room"),
+                "content_preview": (h.get("text") or "")[:800],
+                "similarity": h.get("similarity"),
+                "source_file": h.get("source_file"),
+                "filed_at": h.get("filed_at") or h.get("added_at"),
+            }
+            for h in hits
+        ],
+        "total": len(hits),
+    }
+
+
+@app.delete("/api/memories/{drawer_id}")
+async def memories_delete(drawer_id: str):
+    try:
+        result = tool_delete_drawer(drawer_id)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    if result.get("success"):
+        return {"ok": True, "drawer_id": drawer_id}
+    raise HTTPException(500, result.get("error", "delete failed"))
+
+
+@app.post("/api/palace/backup")
+async def palace_backup():
+    """Snapshot palace + pending + KG to ~/.mempalace/backups/palace-<ts>."""
+    import shutil
+    home = Path(os.path.expanduser("~"))
+    base = home / ".mempalace"
+    backup_root = base / "backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    made = {}
+    errors = []
+
+    palace = base / "palace"
+    if palace.exists():
+        try:
+            dest = backup_root / f"palace-{ts}"
+            shutil.copytree(palace, dest)
+            made["palace"] = str(dest)
+        except Exception as e:
+            errors.append(f"palace: {e}")
+
+    for name in ("pending.sqlite3", "knowledge_graph.sqlite3"):
+        src = base / name
+        if src.exists():
+            try:
+                dest = backup_root / f"{Path(name).stem}-{ts}.sqlite3"
+                shutil.copy2(src, dest)
+                made[Path(name).stem] = str(dest)
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+
+    return {
+        "ok": len(errors) == 0,
+        "timestamp": ts,
+        "created": made,
+        "errors": errors,
+    }
+
+
+@app.get("/api/palace/backups")
+async def palace_backups_list():
+    """List existing snapshots. Newest first."""
+    home = Path(os.path.expanduser("~"))
+    root = home / ".mempalace" / "backups"
+    if not root.is_dir():
+        return {"backups": []}
+    entries = []
+    for p in root.iterdir():
+        try:
+            stat = p.stat()
+        except OSError:
+            continue
+        entries.append({
+            "name": p.name,
+            "path": str(p),
+            "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            "size_bytes": stat.st_size if p.is_file() else None,
+            "is_dir": p.is_dir(),
+        })
+    entries.sort(key=lambda d: d["modified"], reverse=True)
+    return {"backups": entries}
+
+
+class PalaceNukeBody(BaseModel):
+    confirm: str
+
+
+_NUKE_PHRASE = "WIPE MY MEMORY"
+
+
+@app.post("/api/palace/nuke")
+async def palace_nuke(body: PalaceNukeBody):
+    """Wipe all drawers, knowledge-graph entities/triples, and pending queues.
+
+    Guarded by an exact-match typed phrase so accidental clicks can't trigger it.
+    Does NOT touch: identity, personas, agents, MCP configs, backups, chat
+    sessions (those are client-side localStorage), or the disk snapshots under
+    ~/.mempalace/backups/.
+    """
+    if body.confirm != _NUKE_PHRASE:
+        raise HTTPException(
+            400,
+            f'typed confirmation does not match. expected exactly: "{_NUKE_PHRASE}"',
+        )
+    counts = {
+        "drawers": 0,
+        "kg_entities": 0,
+        "kg_triples": 0,
+        "pending_drawers": 0,
+        "pending_questions": 0,
+        "errors": [],
+    }
+
+    # 1. Drawers (ChromaDB)
+    try:
+        col = _safe_collection()
+        if col is not None:
+            got = col.get()
+            all_ids = got.get("ids") or []
+            if all_ids:
+                col.delete(ids=all_ids)
+                counts["drawers"] = len(all_ids)
+    except Exception as e:
+        counts["errors"].append(f"drawers: {e}")
+
+    # 2. Knowledge graph (SQLite)
+    try:
+        from mempalace.knowledge_graph import KnowledgeGraph
+        kg = KnowledgeGraph()
+        with kg._lock:
+            conn = kg._conn()
+            counts["kg_triples"] = int(
+                conn.execute("SELECT COUNT(*) FROM triples").fetchone()[0]
+            )
+            counts["kg_entities"] = int(
+                conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+            )
+            conn.execute("DELETE FROM triples")
+            conn.execute("DELETE FROM entities")
+            conn.commit()
+    except Exception as e:
+        counts["errors"].append(f"kg: {e}")
+
+    # 3. Pending store (SQLite)
+    try:
+        from mempalace.pending_store import PendingStore
+        store = PendingStore()
+        with store._lock:
+            conn = store._conn()
+            counts["pending_drawers"] = int(
+                conn.execute("SELECT COUNT(*) FROM drawers_pending").fetchone()[0]
+            )
+            counts["pending_questions"] = int(
+                conn.execute("SELECT COUNT(*) FROM questions_pending").fetchone()[0]
+            )
+            conn.execute("DELETE FROM drawers_pending")
+            conn.execute("DELETE FROM questions_pending")
+            conn.commit()
+    except Exception as e:
+        counts["errors"].append(f"pending: {e}")
+
+    return {"ok": True, "counts": counts, "confirm_phrase": _NUKE_PHRASE}
+
+
+@app.get("/api/palace/nuke-phrase")
+async def palace_nuke_phrase():
+    """Expose the required confirmation phrase to the UI (avoids hardcoding)."""
+    return {"phrase": _NUKE_PHRASE}
+
+
+class RenameTopicBody(BaseModel):
+    from_topic: str
+    to_topic: str
+
+
+@app.post("/api/memories/rename-topic")
+async def memories_rename_topic(body: RenameTopicBody):
+    """Move every drawer from `from_topic` → `to_topic`.
+
+    Effectively renames/merges a topic. Uses tool_update_drawer per drawer so
+    the drawer_id is regenerated under the new wing and metadata stays
+    consistent.
+    """
+    try:
+        old = sanitize_name(body.from_topic, "from_topic")
+        new = sanitize_name(body.to_topic, "to_topic")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if old == new:
+        return {"ok": True, "moved": 0, "note": "same topic, no change"}
+
+    moved = 0
+    errors: list[dict] = []
+    offset = 0
+    page = 500
+    while True:
+        try:
+            result = tool_list_drawers(wing=old, limit=page, offset=offset)
+        except Exception as e:
+            raise HTTPException(500, str(e))
+        items = result.get("drawers") or []
+        if not items:
+            break
+        ids = [it.get("drawer_id") for it in items if it.get("drawer_id")]
+        for did in ids:
+            try:
+                r = tool_update_drawer(drawer_id=did, wing=new)
+                if r.get("success"):
+                    moved += 1
+                else:
+                    errors.append({"id": did, "error": r.get("error")})
+            except Exception as e:
+                errors.append({"id": did, "error": str(e)})
+        if len(items) < page:
+            break
+        offset += page
+    return {
+        "ok": True,
+        "from": old,
+        "to": new,
+        "moved": moved,
+        "errors": errors,
+    }
+
+
+class MemoriesBulkDeleteBody(BaseModel):
+    ids: Optional[list[str]] = None       # delete exactly these drawers
+    topic: Optional[str] = None           # OR: delete all matching filter
+    section: Optional[str] = None
+    all_matching: bool = False            # must be True to accept filter mode
+
+
+@app.post("/api/memories/bulk-delete")
+async def memories_bulk_delete(body: MemoriesBulkDeleteBody):
+    if body.ids:
+        ids = list(body.ids)
+    elif body.all_matching:
+        # Filter mode: gather every drawer matching the filter, then delete.
+        collected: list[str] = []
+        offset = 0
+        page = 500
+        while True:
+            try:
+                result = tool_list_drawers(
+                    wing=body.topic or None,
+                    room=body.section or None,
+                    limit=page,
+                    offset=offset,
+                )
+            except Exception as e:
+                raise HTTPException(500, str(e))
+            items = result.get("drawers", []) or []
+            if not items:
+                break
+            for it in items:
+                did = it.get("drawer_id") or it.get("id")
+                if did:
+                    collected.append(did)
+            if len(items) < page:
+                break
+            offset += page
+        ids = collected
+    else:
+        raise HTTPException(
+            400,
+            "pass `ids` (list) or `all_matching: true` (with optional topic/section)",
+        )
+
+    deleted = 0
+    errors: list[dict] = []
+    for did in ids:
+        try:
+            result = tool_delete_drawer(did)
+            if result.get("success"):
+                deleted += 1
+            else:
+                errors.append({"id": did, "error": result.get("error", "unknown")})
+        except Exception as e:
+            errors.append({"id": did, "error": str(e)})
+    return {"ok": True, "deleted": deleted, "requested": len(ids), "errors": errors}
+
+
+# ── Drawer edit/move (used by the save chip 'change' button) ────────────
+
+
+class DrawerMoveBody(BaseModel):
+    topic: Optional[str] = None  # new wing
+    section: Optional[str] = None  # new room
+    content: Optional[str] = None
+
+
+@app.post("/api/drawers/{drawer_id}/move")
+async def drawers_move(drawer_id: str, body: DrawerMoveBody):
+    wing = section = None
+    if body.topic:
+        try:
+            wing = sanitize_name(body.topic, "topic")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    if body.section:
+        try:
+            section = sanitize_name(body.section, "section")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    if not (wing or section or body.content):
+        raise HTTPException(400, "pass at least one of topic, section, content")
+    try:
+        result = tool_update_drawer(
+            drawer_id=drawer_id,
+            content=body.content,
+            wing=wing,
+            room=section,
+        )
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    if result.get("success"):
+        return {"ok": True, "drawer_id": drawer_id, "topic": wing, "section": section}
+    raise HTTPException(500, result.get("error", "move failed"))
+
+
+# ── Smart import: LLM-based wing classification ─────────────────────────
+
+
+class ImportsPlanBody(BaseModel):
+    path: str
+    model: Optional[str] = None  # Ollama model — defaults to current chat model
+    sample_size: int = 300       # cap convos sent to classifier (token safety)
+
+
+class PlannedWing(BaseModel):
+    name: str
+    description: str = ""
+    convo_ids: list[str] = Field(default_factory=list)
+
+
+class ImportsCommitBody(BaseModel):
+    path: str
+    plan: list[PlannedWing]
+    extract: Optional[str] = None  # "general" or None
+    review: bool = True
+
+
+def _classifier_prompt(convos: list, existing_wings: list) -> str:
+    lines = []
+    for c in convos:
+        name = (c.get("name") or "").replace("\n", " ")[:120]
+        summary = (c.get("summary") or "").replace("\n", " ")[:180]
+        lines.append(f"{c['uuid']}: \"{name}\" — {summary}")
+    existing_str = ", ".join(existing_wings) if existing_wings else "(none)"
+    return (
+        "You are organizing someone's chat history into WINGS — top-level "
+        "buckets for their personal memory palace. Each wing is a broad "
+        "domain (e.g. 'coding', 'personal-finance', 'creative-writing', "
+        "'keepers-temple-work').\n\n"
+        f"Existing wings in the user's palace (reuse these when a fit is "
+        f"clear, only propose new ones when no existing wing matches): "
+        f"{existing_str}\n\n"
+        "Rules:\n"
+        "- Group into 4–12 wings total. Fewer is better if possible.\n"
+        "- Wing names MUST be short, lowercase, hyphen-separated "
+        "  (e.g. 'coding-help'). No spaces, no apostrophes.\n"
+        "- Every conversation must be assigned to exactly one wing.\n"
+        "- Cluster by topic / domain, not by time.\n"
+        "- A short wing description helps the user.\n\n"
+        "Return JSON ONLY (no prose, no markdown) in this shape:\n"
+        '{"wings": [{"name": "...", "description": "...", '
+        '"convo_ids": ["..."]}]}\n\n'
+        "Conversations:\n" + "\n".join(lines)
+    )
+
+
+async def _list_existing_wings() -> list[str]:
+    col = _safe_collection()
+    if col is None:
+        return []
+    try:
+        got = col.get(include=["metadatas"])
+    except Exception:
+        return []
+    seen = set()
+    for m in got.get("metadatas") or []:
+        w = (m or {}).get("wing")
+        if w and not str(w).startswith("_"):
+            seen.add(str(w))
+    return sorted(seen)
+
+
+def _parse_plan_json(raw: str) -> list[dict]:
+    """Salvage JSON from an LLM response, with fallbacks for stray prose."""
+    import re as _re
+    txt = raw.strip()
+    # Strip markdown fences if present
+    if txt.startswith("```"):
+        txt = _re.sub(r"^```(?:json)?\s*|\s*```$", "", txt, flags=_re.DOTALL)
+    # Find first { ... } block
+    start = txt.find("{")
+    end = txt.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError(f"no JSON object in response (first 200 chars: {raw[:200]!r})")
+    obj = json.loads(txt[start : end + 1])
+    wings = obj.get("wings")
+    if not isinstance(wings, list):
+        raise ValueError("response has no 'wings' list")
+    return wings
+
+
+@app.post("/api/imports/plan/stream")
+async def imports_plan_stream(body: ImportsPlanBody):
+    """Same as /api/imports/plan but streams phase/progress events so the UI
+    can show a real progress bar. Emits JSON lines prefixed with 'data: '
+    (SSE style) for:
+      - {"type":"phase", "label":..., "approx_total":N}
+      - {"type":"progress", "bytes":N}
+      - {"type":"done", "payload":{...}}        (terminal event, same shape as /plan)
+      - {"type":"error", "message":...}          (terminal event)
+    """
+    from mempalace.export_scanner import scan_export
+
+    async def generator():
+        def event(obj):
+            return f"data: {json.dumps(obj, default=str)}\n\n".encode()
+
+        try:
+            yield event({"type": "phase", "label": "Scanning export folder"})
+            try:
+                scan = scan_export(body.path)
+            except ValueError as e:
+                yield event({"type": "error", "message": str(e)})
+                return
+
+            if scan["format"] == "unknown" and not scan["convos"]:
+                yield event({
+                    "type": "error",
+                    "message": "No conversations found. Pick a Claude data export folder or conversations.json.",
+                })
+                return
+
+            convos = scan["convos"]
+            sample = convos[: body.sample_size]
+            existing = await _list_existing_wings()
+
+            yield event({
+                "type": "phase",
+                "label": f"Found {len(convos)} conversations; preparing classifier prompt…",
+            })
+
+            model = body.model or os.environ.get("OLLAMA_DEFAULT_MODEL") or "gpt-oss:20b"
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as c:
+                    tags = (await c.get(f"{OLLAMA_HOST}/api/tags")).json()
+                    available = [m["name"] for m in tags.get("models", [])]
+                    if model not in available and available:
+                        model = available[0]
+            except Exception:
+                pass
+
+            prompt = _classifier_prompt(sample, existing)
+            # Rough expected output size: ~25 chars per convo assignment + wing
+            # metadata (~1-2KB). Used purely for the progress bar's scale.
+            approx_total = max(1024, len(sample) * 30 + 2048)
+
+            yield event({
+                "type": "phase",
+                "label": f"Classifying via {model}…",
+                "approx_total": approx_total,
+            })
+
+            raw_chunks: list[str] = []
+            bytes_so_far = 0
+            try:
+                async with httpx.AsyncClient(timeout=1200.0) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{OLLAMA_HOST}/api/chat",
+                        json={
+                            "model": model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "stream": True,
+                            "format": "json",
+                            "options": {"temperature": 0.2},
+                        },
+                    ) as r:
+                        r.raise_for_status()
+                        async for line in r.aiter_lines():
+                            if not line.strip():
+                                continue
+                            try:
+                                piece = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            msg = piece.get("message") or {}
+                            chunk = msg.get("content") or ""
+                            if chunk:
+                                raw_chunks.append(chunk)
+                                bytes_so_far += len(chunk.encode())
+                                yield event({"type": "progress", "bytes": bytes_so_far})
+                            if piece.get("done"):
+                                break
+            except httpx.HTTPError as e:
+                yield event({"type": "error", "message": f"Ollama call failed: {e}"})
+                return
+
+            raw = "".join(raw_chunks)
+            try:
+                wings = _parse_plan_json(raw)
+            except (ValueError, json.JSONDecodeError) as e:
+                yield event({
+                    "type": "error",
+                    "message": f"classifier returned unparseable JSON: {e}. First 400 chars: {raw[:400]}",
+                })
+                return
+
+            # Same normalization as the non-streaming endpoint
+            sample_ids = {c["uuid"] for c in sample}
+            assigned: dict[str, str] = {}
+            normalized_wings: list[dict] = []
+            for w in wings:
+                name = str(w.get("name") or "").strip().lower().replace(" ", "-")
+                if not name:
+                    continue
+                desc = str(w.get("description") or "").strip()
+                ids = [str(i) for i in w.get("convo_ids") or [] if i]
+                normalized_wings.append({"name": name, "description": desc, "convo_ids": []})
+                for cid in ids:
+                    if cid in sample_ids and cid not in assigned:
+                        assigned[cid] = name
+                        normalized_wings[-1]["convo_ids"].append(cid)
+
+            missed = [c for c in sample if c["uuid"] not in assigned]
+            if missed:
+                fallback = next(
+                    (w for w in normalized_wings if w["name"] in ("misc", "other", "uncategorized")),
+                    None,
+                )
+                if not fallback:
+                    fallback = {"name": "misc", "description": "Uncategorized", "convo_ids": []}
+                    normalized_wings.append(fallback)
+                for c in missed:
+                    assigned[c["uuid"]] = fallback["name"]
+                    fallback["convo_ids"].append(c["uuid"])
+
+            overflow = [c for c in convos if c["uuid"] not in assigned]
+            if overflow:
+                def score(c, wing):
+                    blob = (c.get("name", "") + " " + c.get("summary", "")).lower()
+                    kw_src = (wing["name"].replace("-", " ") + " " + wing["description"]).lower()
+                    kws = [t for t in kw_src.split() if len(t) > 3]
+                    return sum(1 for t in kws if t in blob)
+                fallback_wing = next(
+                    (w for w in normalized_wings if w["name"] == "misc"),
+                    normalized_wings[0] if normalized_wings else None,
+                )
+                for c in overflow:
+                    best = None
+                    best_s = 0
+                    for w in normalized_wings:
+                        s = score(c, w)
+                        if s > best_s:
+                            best = w
+                            best_s = s
+                    target = best or fallback_wing
+                    if target:
+                        target["convo_ids"].append(c["uuid"])
+                        assigned[c["uuid"]] = target["name"]
+
+            titles = {c["uuid"]: c["name"] for c in convos}
+            summaries = {c["uuid"]: c["summary"] for c in convos}
+
+            yield event({
+                "type": "done",
+                "payload": {
+                    "path": scan["path"],
+                    "format": scan["format"],
+                    "convos_total": len(convos),
+                    "metadata_files": scan["metadata_files"],
+                    "skipped": scan["skipped"],
+                    "existing_wings": existing,
+                    "model_used": model,
+                    "plan": normalized_wings,
+                    "titles": titles,
+                    "summaries": summaries,
+                },
+            })
+        except Exception as e:
+            yield event({"type": "error", "message": f"unexpected: {e}"})
+
+    return StreamingResponse(generator(), media_type="text/event-stream")
+
+
+@app.post("/api/imports/plan")
+async def imports_plan(body: ImportsPlanBody):
+    from mempalace.export_scanner import scan_export
+    try:
+        scan = scan_export(body.path)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    if scan["format"] == "unknown" and not scan["convos"]:
+        raise HTTPException(
+            400,
+            "no conversations found. Make sure the folder is a Claude data export "
+            "(should contain conversations.json).",
+        )
+
+    convos = scan["convos"]
+    # Cap what we send to the LLM to avoid runaway context. If there are more
+    # than sample_size, classify a sample to get wings, then bucket the rest
+    # via string-match on the sample (simple + cheap).
+    sample = convos[: body.sample_size]
+
+    existing = await _list_existing_wings()
+
+    model = body.model or os.environ.get("OLLAMA_DEFAULT_MODEL") or "gpt-oss:20b"
+    # Try user's current preferred model first; fall back to first installed
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            tags = (await client.get(f"{OLLAMA_HOST}/api/tags")).json()
+            available = [m["name"] for m in tags.get("models", [])]
+            if model not in available and available:
+                model = available[0]
+    except Exception:
+        pass
+
+    prompt = _classifier_prompt(sample, existing)
+    try:
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            r = await client.post(
+                f"{OLLAMA_HOST}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "format": "json",
+                    "options": {"temperature": 0.2},
+                },
+            )
+            r.raise_for_status()
+            raw = (r.json().get("message", {}) or {}).get("content", "")
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Ollama call failed: {e}")
+
+    try:
+        wings = _parse_plan_json(raw)
+    except (ValueError, json.JSONDecodeError) as e:
+        raise HTTPException(
+            500,
+            f"classifier returned unparseable JSON: {e}. Raw: {raw[:400]}",
+        )
+
+    # Normalize and repair: every sample convo must be assigned to exactly
+    # one wing. Convos outside the sample get bucketed by matching their name
+    # against known wing names + descriptions.
+    sample_ids = {c["uuid"] for c in sample}
+    assigned: dict[str, str] = {}  # convo_id -> wing_name
+    normalized_wings: list[dict] = []
+    for w in wings:
+        name = str(w.get("name") or "").strip().lower().replace(" ", "-")
+        if not name:
+            continue
+        desc = str(w.get("description") or "").strip()
+        ids = [str(i) for i in w.get("convo_ids") or [] if i]
+        normalized_wings.append({"name": name, "description": desc, "convo_ids": []})
+        for cid in ids:
+            if cid in sample_ids and cid not in assigned:
+                assigned[cid] = name
+                normalized_wings[-1]["convo_ids"].append(cid)
+
+    # Force-assign any sample convo the LLM forgot into a fallback wing.
+    missed = [c for c in sample if c["uuid"] not in assigned]
+    if missed:
+        fallback = next(
+            (w for w in normalized_wings if w["name"] in ("misc", "other", "uncategorized")),
+            None,
+        )
+        if not fallback:
+            fallback = {"name": "misc", "description": "Uncategorized", "convo_ids": []}
+            normalized_wings.append(fallback)
+        for c in missed:
+            assigned[c["uuid"]] = fallback["name"]
+            fallback["convo_ids"].append(c["uuid"])
+
+    # Bucket any overflow convos (if we capped via sample_size) by keyword-match
+    # on their name/summary against the wing descriptions the LLM produced.
+    overflow = [c for c in convos if c["uuid"] not in assigned]
+    if overflow:
+        def score(c, wing):
+            blob = (c.get("name", "") + " " + c.get("summary", "")).lower()
+            kw_src = (wing["name"].replace("-", " ") + " " + wing["description"]).lower()
+            kws = [t for t in kw_src.split() if len(t) > 3]
+            return sum(1 for t in kws if t in blob)
+
+        fallback_wing = next(
+            (w for w in normalized_wings if w["name"] == "misc"),
+            normalized_wings[0] if normalized_wings else None,
+        )
+        for c in overflow:
+            best = None
+            best_s = 0
+            for w in normalized_wings:
+                s = score(c, w)
+                if s > best_s:
+                    best = w
+                    best_s = s
+            target = best or fallback_wing
+            if target:
+                target["convo_ids"].append(c["uuid"])
+                assigned[c["uuid"]] = target["name"]
+
+    # Build a title map for the UI.
+    titles = {c["uuid"]: c["name"] for c in convos}
+    summaries = {c["uuid"]: c["summary"] for c in convos}
+
+    return {
+        "path": scan["path"],
+        "format": scan["format"],
+        "convos_total": len(convos),
+        "metadata_files": scan["metadata_files"],
+        "skipped": scan["skipped"],
+        "existing_wings": existing,
+        "model_used": model,
+        "plan": normalized_wings,
+        "titles": titles,
+        "summaries": summaries,
+    }
+
+
+@app.post("/api/imports/commit")
+async def imports_commit(body: ImportsCommitBody):
+    from mempalace.export_scanner import scan_export
+    from mempalace.pending_store import PendingStore
+    from mempalace.general_extractor import extract_memories
+    from mempalace.miner import add_drawer as miner_add_drawer
+
+    try:
+        scan = scan_export(body.path)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    convos_by_id = {c["uuid"]: c for c in scan["convos"]}
+    col = _safe_collection()
+    if col is None and not (body.review and body.extract == "general"):
+        raise HTTPException(500, "palace collection unavailable")
+
+    store = None
+    if body.review and body.extract == "general":
+        store = PendingStore()
+
+    total_committed = 0
+    total_pending = 0
+    per_wing = []
+    for wing in body.plan:
+        try:
+            wing_name = sanitize_name(wing.name, "wing")
+        except ValueError as e:
+            raise HTTPException(400, f"wing '{wing.name}': {e}")
+        committed = 0
+        pending = 0
+        for cid in wing.convo_ids:
+            convo = convos_by_id.get(cid)
+            if convo is None:
+                continue
+            text = convo["text"]
+            source_conversation = f"{convo['name'][:60]} ({cid[:8]})"
+
+            if body.extract == "general":
+                chunks = extract_memories(text)
+                if body.review and store is not None:
+                    for ch in chunks:
+                        store.add_pending_drawer(
+                            content=ch["content"],
+                            proposed_wing=wing_name,
+                            proposed_room=ch.get("memory_type", "general"),
+                            memory_type=ch.get("memory_type"),
+                            keyword_score=ch.get("keyword_score"),
+                            source_conversation=source_conversation,
+                        )
+                    pending += len(chunks)
+                    continue
+                else:
+                    for idx, ch in enumerate(chunks):
+                        miner_add_drawer(
+                            collection=col,
+                            wing=wing_name,
+                            room=ch.get("memory_type", "general"),
+                            content=ch["content"],
+                            source_file=f"smart-import:{cid}",
+                            chunk_index=idx,
+                            agent="smart-import",
+                        )
+                        committed += 1
+                    continue
+
+            # Default mode: file the full transcript as one drawer per convo
+            # (verbatim, no inference). Room = "chats" for clarity.
+            miner_add_drawer(
+                collection=col,
+                wing=wing_name,
+                room="chats",
+                content=text,
+                source_file=f"smart-import:{cid}",
+                chunk_index=0,
+                agent="smart-import",
+            )
+            committed += 1
+        total_committed += committed
+        total_pending += pending
+        per_wing.append({
+            "wing": wing_name,
+            "committed": committed,
+            "pending": pending,
+            "convos": len(wing.convo_ids),
+        })
+
+    return {
+        "ok": True,
+        "total_committed": total_committed,
+        "total_pending": total_pending,
+        "per_wing": per_wing,
+    }
+
+
+class NativePickBody(BaseModel):
+    kind: str = "any"  # "any" | "folder" | "file" — "any" lets the user pick either
+
+
+# JavaScript for Automation script that opens a unified NSOpenPanel allowing
+# either a folder OR a .json file. AppleScript's `choose folder` / `choose file`
+# don't support this combo natively, but NSOpenPanel does.
+_JXA_UNIFIED_PICKER = """
+ObjC.import('AppKit');
+const panel = $.NSOpenPanel.openPanel;
+panel.setTitle('Pick a folder or JSON file to import');
+panel.setPrompt('Choose');
+panel.setCanChooseFiles(true);
+panel.setCanChooseDirectories(true);
+panel.setAllowsMultipleSelection(false);
+panel.setCanCreateDirectories(false);
+panel.setAllowedFileTypes($(['json']));
+// Raise the dialog to the front (osascript often runs headless).
+$.NSApp.activateIgnoringOtherApps(true);
+const response = panel.runModal;
+if (response == 1 && panel.URLs.count > 0) {
+  panel.URLs.objectAtIndex(0).path.js;
+} else {
+  '__CANCELLED__';
+}
+""".strip()
+
+
+@app.post("/api/fs/native-pick")
+async def fs_native_pick(body: Optional[NativePickBody] = None):
+    """Pop the native macOS picker. 'any' opens a unified NSOpenPanel where
+    the user can choose either a folder or a JSON file from the same dialog.
+    """
+    if sys.platform != "darwin":
+        raise HTTPException(
+            501, "native picker is macOS-only; use the in-app Browse instead"
+        )
+    kind = (body.kind if body else "any").lower()
+
+    if kind in ("any", "either", ""):
+        args = ["osascript", "-l", "JavaScript", "-e", _JXA_UNIFIED_PICKER]
+    elif kind == "file":
+        script = (
+            'try\n'
+            '  set f to choose file with prompt "Pick a JSON export file" '
+            'of type {"json", "public.json"}\n'
+            '  POSIX path of f\n'
+            'on error number -128\n'
+            '  return "__CANCELLED__"\n'
+            'end try'
+        )
+        args = ["osascript", "-e", script]
+    else:  # folder
+        script = (
+            'try\n'
+            '  set f to choose folder with prompt "Pick a folder to import"\n'
+            '  POSIX path of f\n'
+            'on error number -128\n'
+            '  return "__CANCELLED__"\n'
+            'end try'
+        )
+        args = ["osascript", "-e", script]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "native picker timed out (5 min)")
+    if proc.returncode != 0:
+        raise HTTPException(
+            500, f"osascript failed: {(stderr or b'').decode().strip()}"
+        )
+    out = stdout.decode().strip()
+    if out == "__CANCELLED__" or not out:
+        return {"cancelled": True}
+    if out.endswith("/") and out != "/":
+        out = out[:-1]
+    return {"path": out}
+
+
+@app.get("/api/fs/browse")
+async def fs_browse(path: Optional[str] = None):
+    """Local directory browser for the import picker.
+
+    Security: paths must resolve under the user's HOME. Symlinks that escape
+    HOME are skipped. No hidden dirs unless explicitly navigated to (we just
+    return them marked `hidden`).
+    """
+    home = os.path.expanduser("~")
+    home_real = os.path.realpath(home)
+    raw = path or home
+    target = os.path.realpath(os.path.expanduser(raw))
+    if not (target == home_real or target.startswith(home_real + os.sep)):
+        raise HTTPException(400, "path must be under HOME")
+    if not os.path.isdir(target):
+        raise HTTPException(404, f"not a directory: {target}")
+
+    entries = []
+    try:
+        with os.scandir(target) as it:
+            for e in it:
+                try:
+                    if not e.is_dir(follow_symlinks=False):
+                        continue
+                    # Skip symlinks that escape HOME.
+                    resolved = os.path.realpath(e.path)
+                    if not (resolved == home_real or resolved.startswith(home_real + os.sep)):
+                        continue
+                except OSError:
+                    continue
+                entries.append({
+                    "name": e.name,
+                    "path": e.path,
+                    "hidden": e.name.startswith("."),
+                })
+    except PermissionError:
+        raise HTTPException(403, "permission denied")
+    entries.sort(key=lambda d: (d["hidden"], d["name"].lower()))
+
+    parent = os.path.dirname(target)
+    can_go_up = target != home_real and (
+        parent == home_real or parent.startswith(home_real + os.sep)
+    )
+
+    crumbs = []
+    cursor = target
+    while True:
+        crumbs.append({"name": os.path.basename(cursor) or cursor, "path": cursor})
+        if cursor == home_real:
+            break
+        parent_c = os.path.dirname(cursor)
+        if parent_c == cursor:
+            break
+        if not (parent_c == home_real or parent_c.startswith(home_real + os.sep)):
+            break
+        cursor = parent_c
+    crumbs.reverse()
+
+    return {
+        "path": target,
+        "home": home_real,
+        "parent": parent if can_go_up else None,
+        "crumbs": crumbs,
+        "entries": entries,
+    }
+
+
 @app.post("/api/wings/{wing}/import-convos")
 async def import_convos(wing: str, body: ConvoImportBody):
     """Import a folder of conversation exports into the wing.
@@ -956,6 +2039,10 @@ async def import_convos(wing: str, body: ConvoImportBody):
     ]
     if body.limit:
         cmd.extend(["--limit", str(body.limit)])
+    if body.extract:
+        cmd.extend(["--extract", body.extract])
+    if body.review and (body.extract == "general"):
+        cmd.append("--review")
 
     try:
         result = subprocess.run(
@@ -971,11 +2058,198 @@ async def import_convos(wing: str, body: ConvoImportBody):
             + (result.stderr or result.stdout)[-1500:],
         )
 
+    pending_count = 0
+    questions_count = 0
+    try:
+        from mempalace.pending_store import PendingStore
+        store = PendingStore()
+        pending_count = store.count_pending()
+        questions_count = store.count_questions()
+    except Exception:
+        pass
+
     return {
         "ok": True,
         "wing": wing,
         "stdout_tail": result.stdout[-2000:],
+        "pending_count": pending_count,
+        "questions_count": questions_count,
     }
+
+
+# ── Review gate: import-time staging for classified inferences ──────────
+#
+# Only populated when /api/wings/{wing}/import-convos runs with
+# extract="general" + review=True. Runtime chat and verbatim mining are
+# not affected.
+
+
+class ReviewEditBody(BaseModel):
+    content: Optional[str] = None
+    wing: Optional[str] = None
+    room: Optional[str] = None
+
+
+class ReviewBulkBody(BaseModel):
+    source: str
+    action: str  # "accept" | "reject"
+
+
+class QuestionAnswerBody(BaseModel):
+    answer: str
+
+
+def _pending_store():
+    from mempalace.pending_store import PendingStore
+    return PendingStore()
+
+
+def _commit_pending_to_palace(item: dict, added_by: str = "mempalace-review") -> bool:
+    """Write an approved pending drawer into ChromaDB via miner.add_drawer."""
+    from mempalace.miner import add_drawer as miner_add_drawer
+    col = _safe_collection()
+    if col is None:
+        raise HTTPException(500, "palace collection unavailable")
+    source_file = item.get("source_conversation") or f"review:{item['id']}"
+    miner_add_drawer(
+        collection=col,
+        wing=item["proposed_wing"],
+        room=item["proposed_room"],
+        content=item["content"],
+        source_file=source_file,
+        chunk_index=0,
+        agent=added_by,
+    )
+    return True
+
+
+@app.get("/api/review/sources")
+async def review_sources():
+    store = _pending_store()
+    return {"sources": store.list_pending_sources()}
+
+
+@app.get("/api/review")
+async def review_list(
+    source: Optional[str] = None, limit: int = 100, offset: int = 0
+):
+    store = _pending_store()
+    return {
+        "items": store.list_pending(limit=limit, offset=offset, source=source),
+        "total": store.count_pending(source=source),
+    }
+
+
+@app.post("/api/review/{drawer_id}/accept")
+async def review_accept(drawer_id: str):
+    store = _pending_store()
+    item = store.get_pending(drawer_id)
+    if not item:
+        raise HTTPException(404, "pending drawer not found")
+    if item["status"] != "pending":
+        raise HTTPException(409, f"drawer already {item['status']}")
+    _commit_pending_to_palace(item)
+    store.mark_approved(drawer_id)
+    return {"ok": True, "id": drawer_id}
+
+
+@app.post("/api/review/{drawer_id}/edit")
+async def review_edit(drawer_id: str, body: ReviewEditBody):
+    store = _pending_store()
+    item = store.get_pending(drawer_id)
+    if not item:
+        raise HTTPException(404, "pending drawer not found")
+    if item["status"] != "pending":
+        raise HTTPException(409, f"drawer already {item['status']}")
+    wing = body.wing
+    room = body.room
+    if wing:
+        try:
+            wing = sanitize_name(wing, "wing")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    if room:
+        try:
+            room = sanitize_name(room, "room")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    store.apply_edits(drawer_id, content=body.content, wing=wing, room=room)
+    return {"ok": True, "id": drawer_id}
+
+
+@app.post("/api/review/{drawer_id}/reject")
+async def review_reject(drawer_id: str):
+    store = _pending_store()
+    item = store.get_pending(drawer_id)
+    if not item:
+        raise HTTPException(404, "pending drawer not found")
+    if item["status"] != "pending":
+        raise HTTPException(409, f"drawer already {item['status']}")
+    store.mark_rejected(drawer_id)
+    return {"ok": True, "id": drawer_id}
+
+
+@app.post("/api/review/bulk")
+async def review_bulk(body: ReviewBulkBody):
+    if body.action not in ("accept", "reject"):
+        raise HTTPException(400, "action must be 'accept' or 'reject'")
+    store = _pending_store()
+    ids = store.ids_for_source(body.source, status="pending")
+    accepted = 0
+    rejected = 0
+    errors = []
+    for drawer_id in ids:
+        item = store.get_pending(drawer_id)
+        if not item or item["status"] != "pending":
+            continue
+        try:
+            if body.action == "accept":
+                _commit_pending_to_palace(item)
+                store.mark_approved(drawer_id)
+                accepted += 1
+            else:
+                store.mark_rejected(drawer_id)
+                rejected += 1
+        except Exception as e:
+            errors.append({"id": drawer_id, "error": str(e)})
+    return {
+        "ok": True,
+        "source": body.source,
+        "accepted": accepted,
+        "rejected": rejected,
+        "errors": errors,
+    }
+
+
+@app.get("/api/questions")
+async def questions_list():
+    store = _pending_store()
+    items = store.list_questions()
+    return {"items": items, "total": store.count_questions()}
+
+
+@app.post("/api/questions/{question_id}/answer")
+async def questions_answer(question_id: str, body: QuestionAnswerBody):
+    store = _pending_store()
+    q = store.get_question(question_id)
+    if not q:
+        raise HTTPException(404, "question not found")
+    if q["status"] != "open":
+        raise HTTPException(409, f"question already {q['status']}")
+    store.mark_question_answered(question_id, body.answer)
+    return {"ok": True, "id": question_id, "answer": body.answer}
+
+
+@app.post("/api/questions/{question_id}/skip")
+async def questions_skip(question_id: str):
+    store = _pending_store()
+    q = store.get_question(question_id)
+    if not q:
+        raise HTTPException(404, "question not found")
+    if q["status"] != "open":
+        raise HTTPException(409, f"question already {q['status']}")
+    store.mark_question_skipped(question_id)
+    return {"ok": True, "id": question_id}
 
 
 @app.get("/api/recent")
@@ -1009,8 +2283,15 @@ async def recent_activity(limit: int = 20):
 
 
 @app.delete("/api/chat-session/{session_id}")
-async def delete_chat_session(session_id: str):
-    """Delete every drawer tagged with this chat session's id."""
+async def delete_chat_session(session_id: str, drop_memories: bool = False):
+    """Delete drawers tagged with this chat session's id.
+
+    Default (drop_memories=False): no-op — chat sessions are client-side only,
+    memories survive across session deletes. Pass `?drop_memories=true` for the
+    old destructive behavior (still available as an explicit power-user move).
+    """
+    if not drop_memories:
+        return {"deleted": 0, "session_id": session_id, "skipped": True}
     col = _safe_collection()
     if col is None:
         raise HTTPException(404, "No palace yet")
@@ -1721,20 +3002,112 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": (
+                "File a note or quote into the user's palace under a topic and section. "
+                "Call this when the user shares something worth remembering later — a "
+                "decision, plan, preference, event, creative idea, personal detail, or "
+                "any specific fact. Pick the best-fitting existing topic (see 'Existing "
+                "topics' in the system prompt); only propose a NEW topic if no existing "
+                "one fits. Use short, lowercase, hyphen-separated names."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Top-level bucket (mempalace 'wing'). Lowercase, hyphenated. Examples: 'work', 'personal', 'keepers-temple', 'creative-writing'.",
+                    },
+                    "section": {
+                        "type": "string",
+                        "description": "Sub-bucket within the topic (mempalace 'room'). Lowercase, hyphenated. Examples: 'decisions', 'auth-migration', 'daily-journal'.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The memory content. Prefer the user's own words verbatim when possible; distill only when they're lengthy.",
+                    },
+                },
+                "required": ["topic", "section", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_topics",
+            "description": (
+                "List existing topics (wings) in the palace. Call this before proposing "
+                "a new topic if you're not sure whether one already exists. Cheap to call."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
-TOOL_PROTOCOL = (
-    "You have tools available. Use them proactively:\n"
+TOOL_PROTOCOL_BASE = (
+    "You have tools available. Use them proactively and silently:\n"
     "- BEFORE answering about the user's past (preferences, people, projects, "
     "past decisions, events), call memory_search and/or kg_query FIRST. Never guess.\n"
-    "- When the user states a durable fact, preference, or decision, call kg_add.\n"
+    "- When the user shares something worth remembering later — a decision, plan, "
+    "preference, event, creative idea, update, personal detail, or specific fact — "
+    "call save_memory with a fitting topic + section. Prefer verbatim user words as "
+    "the content. REUSE an existing topic when one fits (see list below); propose a "
+    "new topic only when none match. Keep one save_memory call per distinct memory.\n"
+    "- When the user states a durable structured fact (e.g. 'Alex works at X', "
+    "'I prefer dark mode'), also call kg_add so the knowledge graph stays fresh.\n"
     "- When something the user said before has changed, call kg_invalidate on the "
     "old fact, then kg_add the new one.\n"
     "- After a meaningful exchange, optionally call diary_write with a brief "
     "first-person reflection.\n"
-    "Use tools silently — don't narrate 'I'm calling a tool'. Your text reply "
-    "should read naturally."
+    "Never narrate 'I'm calling a tool' — your text reply should read naturally. "
+    "If the user's message isn't worth saving (small talk, clarifying questions, "
+    "confirmations), don't call save_memory.\n"
+    "IMPORTANT: After any tool calls complete, ALWAYS produce a final text reply "
+    "answering the user. Don't stop after just thinking or tool calls — the user "
+    "needs to see a response.\n"
+    "STYLE: Write like you're talking to a friend, not filing a report. Use "
+    "second person ('you') and natural sentences. Weave facts into prose instead "
+    "of dumping them as bold-label bullet points like 'Name: …'  'Profession: …'. "
+    "A sentence like 'You're Pete — creative director and music producer running "
+    "L.I.V. Corp.' beats a three-bullet fact sheet. Only structure with headings/"
+    "bullets if the user explicitly asks for a summary or list."
 )
+
+
+def _existing_topic_names() -> list[str]:
+    """List the wings that already have content. Shape from tool_list_wings:
+    {'wings': {wing_name: drawer_count, ...}}.
+    """
+    try:
+        result = tool_list_wings() or {}
+        wings = result.get("wings") if isinstance(result, dict) else None
+        if isinstance(wings, dict):
+            names = list(wings.keys())
+        elif isinstance(wings, list):
+            names = [
+                str(w.get("wing") or w.get("name") or "").strip()
+                for w in wings if isinstance(w, dict)
+            ]
+        else:
+            names = []
+    except Exception:
+        names = []
+    return sorted({n for n in names if n and not n.startswith("_")})
+
+
+def _build_tool_protocol() -> str:
+    """Append a runtime list of existing topics so the LLM reuses them."""
+    names = _existing_topic_names()
+    if names:
+        display = ", ".join(names[:40])
+        return TOOL_PROTOCOL_BASE + f"\n\nExisting topics (reuse when possible): {display}"
+    return TOOL_PROTOCOL_BASE + "\n\nExisting topics: (none yet — propose fitting new ones)"
+
+
+TOOL_PROTOCOL = TOOL_PROTOCOL_BASE  # legacy; real protocol is built per-request below
 
 
 async def _exec_tool_async(
@@ -1784,7 +3157,10 @@ def _exec_tool(
             q = str(args.get("query") or "").strip()
             if not q:
                 return {"error": "query is required"}
-            wing = args.get("wing") or current_wing
+            # If the LLM doesn't pass an explicit wing, search ALL wings —
+            # it may be hunting for something save_memory filed under a
+            # different wing than the chat's default.
+            wing = args.get("wing") or None
             n = max(1, min(int(args.get("n", 5)), 10))
             result = search_memories(
                 q, palace_path=PALACE_PATH, wing=wing, n_results=n
@@ -1832,6 +3208,42 @@ def _exec_tool(
                 entry,
                 topic=str(args.get("topic") or "general"),
             )
+        if name == "save_memory":
+            topic = str(args.get("topic") or "").strip().lower().replace(" ", "-")
+            section = str(args.get("section") or "").strip().lower().replace(" ", "-")
+            content = str(args.get("content") or "").strip()
+            if not (topic and section and content):
+                return {
+                    "error": "topic, section, and content are all required",
+                    "hint": "pick a short kebab-case topic (e.g. 'work') and section (e.g. 'decisions')",
+                }
+            try:
+                topic = sanitize_name(topic, "topic")
+                section = sanitize_name(section, "section")
+            except ValueError as e:
+                return {"error": f"invalid topic/section: {e}"}
+            result = tool_add_drawer(
+                wing=topic,
+                room=section,
+                content=content,
+                source_file=(
+                    f"chat-save://{session_id or 'no-session'}"
+                    f"/{datetime.now().isoformat()}"
+                ),
+                added_by="ollama-mempalace-save_memory",
+            )
+            if result.get("success"):
+                return {
+                    "ok": True,
+                    "topic": topic,
+                    "section": section,
+                    "drawer_id": result.get("drawer_id"),
+                    "preview": content[:140],
+                }
+            return {"error": result.get("error", "unknown save error")}
+        if name == "list_topics":
+            names = _existing_topic_names()
+            return {"topics": names, "count": len(names)}
         return {"error": f"unknown tool: {name}"}
     except Exception as e:
         return {"error": str(e)}
@@ -1940,16 +3352,41 @@ def _format_memory_block(hits: list[dict]) -> str:
     if not hits:
         return ""
     parts = [
-        "You have access to relevant memories from prior conversations with this user. "
-        "Use them when they help; ignore them when they don't. Do not mention this block exists."
+        "Here are things you've learned about this user from past conversations. "
+        "Weave them into your reply naturally when relevant — don't echo the "
+        "structure below. Never mention that this background exists. "
+        "If these memories contradict the user's current question, prefer a "
+        "fresh memory_search or ask the user — don't assume past assistant "
+        "replies ('I don't have memories of you') are facts about them."
     ]
-    for i, h in enumerate(hits, 1):
-        wing = h.get("wing", "?")
-        room = h.get("room", "?")
-        sim = h.get("similarity", 0)
+    usable = 0
+    for h in hits:
         text = (h.get("text") or "").strip()
-        parts.append(f"\n[memory {i} | {wing}/{room} | similarity={sim}]\n{text}")
-    parts.append("\n--- end memories ---")
+        if not text:
+            continue
+        sim = h.get("similarity")
+        if isinstance(sim, (int, float)) and sim < 0.25:
+            # Low-confidence hit — skip. These are more likely to mislead the
+            # model than help it. Semantic-search floor chosen empirically.
+            continue
+        cleaned = text
+        # Strip saved-transcript framing so the model doesn't re-quote its
+        # own past replies as if they were user facts.
+        if cleaned.startswith("User: "):
+            cleaned = cleaned[6:]
+        # Drop everything from "\n\nAssistant:" onward — the assistant's
+        # prior reply isn't a fact about the user.
+        asst_idx = cleaned.find("\n\nAssistant:")
+        if asst_idx == -1:
+            asst_idx = cleaned.find("\nAssistant:")
+        if asst_idx != -1:
+            cleaned = cleaned[:asst_idx].strip()
+        if not cleaned:
+            continue
+        parts.append(f"- {cleaned}")
+        usable += 1
+    if usable == 0:
+        return ""
     return "\n".join(parts)
 
 
@@ -2073,11 +3510,15 @@ async def chat(req: ChatRequest):
 
     memory_hits: list[dict] = []
     if req.use_memory and last_user:
+        # When auto-filing is on, the LLM spreads memories across many wings,
+        # so pre-turn recall must search cross-wing too. Only scope when tools
+        # are off (classic dropdown flow).
+        recall_wing = None if req.enable_tools else wing
         try:
             result = search_memories(
                 last_user.content,
                 palace_path=PALACE_PATH,
-                wing=wing,
+                wing=recall_wing,
                 n_results=req.memory_limit,
             )
             memory_hits = result.get("results", []) or []
@@ -2096,7 +3537,7 @@ async def chat(req: ChatRequest):
         out_messages.append({"role": "system", "content": req.system_prompt.strip()})
 
     if req.enable_tools:
-        out_messages.append({"role": "system", "content": TOOL_PROTOCOL})
+        out_messages.append({"role": "system", "content": _build_tool_protocol()})
 
     memory_block = _format_memory_block(memory_hits)
     if memory_block:
@@ -2134,6 +3575,9 @@ async def chat(req: ChatRequest):
             yield f"data: {json.dumps(compaction_event)}\n\n"
 
         full_response = ""
+        # Track whether the LLM filed the turn itself via save_memory so we
+        # can skip the transcript auto-save below (avoid double-filing).
+        llm_saves: list[dict] = []
         try:
             if req.enable_tools:
                 # Tool-enabled turn: non-streaming loop so tool_calls arrive intact.
@@ -2189,15 +3633,27 @@ async def chat(req: ChatRequest):
                             )
 
                         if not tool_calls:
-                            full_response = assistant_text
-                            if assistant_text:
-                                yield (
-                                    "data: "
-                                    + json.dumps(
-                                        {"type": "token", "content": assistant_text}
-                                    )
-                                    + "\n\n"
+                            # Fallback: some models (Gemma) emit their entire
+                            # final answer into the `thinking` channel and
+                            # leave `content` empty. Treat thinking as the
+                            # reply in that case so the user isn't stuck on
+                            # an empty bubble.
+                            if not assistant_text and thinking_text:
+                                assistant_text = thinking_text
+                            if not assistant_text:
+                                assistant_text = (
+                                    "_(model returned no reply — try a different model "
+                                    "like qwen3.6 or gpt-oss, or turn off Auto-file memories "
+                                    "in Settings → Conversation if you don't need tools)_"
                                 )
+                            full_response = assistant_text
+                            yield (
+                                "data: "
+                                + json.dumps(
+                                    {"type": "token", "content": assistant_text}
+                                )
+                                + "\n\n"
+                            )
                             break
 
                         # Record the assistant's tool-call message in the history
@@ -2227,6 +3683,13 @@ async def chat(req: ChatRequest):
                             result = await _exec_tool_async(
                                 name, raw_args, wing, req.session_id
                             )
+                            if name == "save_memory" and isinstance(result, dict) and result.get("ok"):
+                                llm_saves.append({
+                                    "topic": result.get("topic"),
+                                    "section": result.get("section"),
+                                    "drawer_id": result.get("drawer_id"),
+                                    "preview": result.get("preview"),
+                                })
                             yield (
                                 "data: "
                                 + json.dumps(
@@ -2332,8 +3795,21 @@ async def chat(req: ChatRequest):
         saved_id: Optional[str] = None
         save_error: Optional[str] = None
         extracted_facts: list[dict] = []
+        kg_added: list[dict] = []
 
-        if req.save_to_memory and last_user and full_response.strip():
+        # Auto-save the transcript ONLY when tools are off. When tools are on,
+        # we trust the LLM's save_memory calls exclusively — otherwise the raw
+        # transcript (including the assistant's own "I don't have memories"
+        # replies) poisons future semantic recall and the model ends up
+        # parroting its past denials back to the user.
+        should_auto_save_transcript = (
+            req.save_to_memory
+            and last_user
+            and full_response.strip()
+            and not req.enable_tools
+            and not llm_saves
+        )
+        if should_auto_save_transcript:
             transcript = (
                 f"User: {last_user.content}\n\nAssistant: {full_response.strip()}"
             )
@@ -2358,7 +3834,6 @@ async def chat(req: ChatRequest):
             if req.auto_extract:
                 extracted_facts = _run_auto_extract(transcript, wing)
 
-            kg_added: list[dict] = []
             if req.auto_kg:
                 kg_model = req.auto_kg_model or req.model
                 triples = await _extract_kg_triples(kg_model, transcript)
@@ -2383,6 +3858,7 @@ async def chat(req: ChatRequest):
                     "save_error": save_error,
                     "extracted_facts": extracted_facts,
                     "kg_added": kg_added if req.auto_kg else [],
+                    "llm_saves": llm_saves,
                 }
             )
             + "\n\n"

@@ -27,7 +27,7 @@
         </button>
       </div>
       <div class="sidebar-actions">
-        <button id="new-chat" class="side-action">
+        <button id="new-chat" class="side-action" title="Start a fresh chat. Prior memories are still recalled; this just opens a clean session.">
           <span class="ic">＋</span> New Chat
         </button>
         <button id="new-incognito" class="side-action" title="Incognito chat: nothing you send is recalled from past memory, nothing is saved to memory after, and no facts are auto-extracted. Like a private browsing tab, but for your AI.">
@@ -51,7 +51,7 @@
           </span>
           Memory
         </button>
-        <button id="open-settings" class="side-action">
+        <button id="open-settings" class="side-action" title="Identity, conversation behavior, voice, wing data, models, agents, MCP integrations.">
           <span class="ic">⚙</span> Settings
         </button>
       </div>
@@ -138,12 +138,12 @@
                 <line x1="8" y1="23" x2="16" y2="23"/>
               </svg>
             </button>
-            <button type="button" id="composer-recall" class="pill-btn toggle" title="Toggle recall">
+            <button type="button" id="composer-recall" class="pill-btn toggle" title="Recall toggle: when ON (default), the assistant pulls relevant memories from past conversations before replying. Turn OFF for a single turn if you want a 'clean slate' answer without prior context.">
               <span class="ic">🧠</span>
               <span class="lbl">recall</span>
             </button>
             <div class="grow"></div>
-            <select id="model" class="model-pick"></select>
+            <select id="model" class="model-pick" title="Ollama model for this chat. For Auto-file memories to work, pick a tool-capable model — gpt-oss:20b, qwen3.6, or deepseek-r1 work well. Smaller Gemma variants often skip tool calls."></select>
             <button type="submit" id="send" class="pill-btn send" title="Send (⌘↵)">↑</button>
           </div>
         </div>
@@ -173,14 +173,14 @@
         </header>
         <div class="settings-layout">
           <nav class="settings-nav" role="tablist">
-            <button class="settings-tab active" data-pane="identity">Identity</button>
-            <button class="settings-tab" data-pane="conversation">Conversation</button>
-            <button class="settings-tab" data-pane="voice">Voice</button>
-            <button class="settings-tab" data-pane="wing-data">Wing data</button>
-            <button class="settings-tab" data-pane="models">Models</button>
-            <button class="settings-tab" data-pane="agents">Agents</button>
-            <button class="settings-tab" data-pane="mcp">MCP</button>
-            <button class="settings-tab" data-pane="reference">Reference</button>
+            <button class="settings-tab active" data-pane="identity" title="Your default persona — name, background, and how the assistant should talk to you. Injected as a system message each turn.">Identity</button>
+            <button class="settings-tab" data-pane="conversation" title="Behavior toggles for each chat: memory recall, auto-save, auto-file memories (agent picks topics), advanced features, and the active wing/topic.">Conversation</button>
+            <button class="settings-tab" data-pane="voice" title="Text-to-speech voices and speech-to-text (whisper) settings.">Voice</button>
+            <button class="settings-tab" data-pane="wing-data" title="Per-wing attachments and the one-time import from Claude / ChatGPT / Slack exports (advanced).">Wing data</button>
+            <button class="settings-tab" data-pane="models" title="Manage installed Ollama models — pull new ones, delete old ones.">Models</button>
+            <button class="settings-tab" data-pane="agents" title="Named sub-agents that can be invoked from chat via tool calls.">Agents</button>
+            <button class="settings-tab" data-pane="mcp" title="External MCP servers — extend the chat agent's toolbox with third-party tools.">MCP</button>
+            <button class="settings-tab" data-pane="reference" title="AAAK compression spec and other reference material for power users.">Reference</button>
           </nav>
           <div class="settings-body">
             <!-- ─── Identity ─────────────────────────────────────────────── -->
@@ -224,11 +224,15 @@
                 <h3>Current chat</h3>
                 <div class="grid">
                   <label>
-                    Wing
+                    <span title="In mempalace's vocabulary, a 'wing' is the top-level bucket for a memory. Think of it as a folder or topic name.">Wing <span class="muted" style="font-weight:normal">(aka topic)</span></span>
                     <span class="caption">
-                      A top-level domain — a project, person, or big topic
-                      (e.g. <code>personal</code>, <code>dos-clone</code>, <code>music</code>).
-                      Memory recall is scoped to the active wing, so unrelated context can't leak in.
+                      A top-level bucket for memories — a project, person, or big
+                      theme (e.g. <code>personal</code>, <code>keepers-temple</code>,
+                      <code>music</code>). With <b>Auto-file memories</b> on, the
+                      assistant picks the topic per memory and recalls across all
+                      of them — this selector only controls attachments, per-wing
+                      system prompts, and the fallback save destination when the
+                      assistant doesn't file a turn itself.
                     </span>
                     <div class="row">
                       <select id="wing"></select>
@@ -238,7 +242,7 @@
                     </div>
                   </label>
                   <label>
-                    Room (advanced)
+                    <span title="A 'room' is a sub-bucket inside a wing (topic). The LLM picks these automatically when Auto-file is on.">Room <span class="muted" style="font-weight:normal">(aka section, advanced)</span></span>
                     <span class="caption">
                       Rooms are usually automatic — auto-extracted facts file themselves into
                       <code>hall_&lt;type&gt;</code> rooms, and project mining derives rooms from
@@ -282,9 +286,13 @@
                     <input id="t-identity" type="checkbox" checked />
                     Inject identity.txt as a system message
                   </label>
-                  <label class="check" title="Let the model decide when to search memory, query the knowledge graph, record facts, and write diary entries. Best with larger models (gemma4, gpt-oss, deepseek-r1, codellama). Smaller models may ignore tools or misuse them. Slower than regular chat because tool calls are non-streaming.">
-                    <input id="t-tools" type="checkbox" />
-                    Enable tools (agent auto-calls memory_search, kg_add, diary_write, …)
+                  <label class="check" title="Let the model decide when to search memory, save new memories to topics/sections, query the knowledge graph, record facts, and write diary entries. Best with larger tool-capable models (qwen, gpt-oss, deepseek-r1). Smaller models may ignore tools. Slower than plain chat because tool calls are non-streaming.">
+                    <input id="t-tools" type="checkbox" checked />
+                    Auto-file memories (agent picks topics/sections and saves silently)
+                  </label>
+                  <label class="check" title="Reveal developer tabs (Stats, Browser, Taxonomy, Graph, Tunnels, Diary) in the Memory panel. Off by default — the Memories tab alone covers the consumer flow. Turn on for raw palace inspection.">
+                    <input id="t-advanced" type="checkbox" />
+                    Show advanced features (developer tabs: taxonomy, graph, tunnels, diary)
                   </label>
                   <label class="check" title="After each turn, run a small LLM pass to extract subject/predicate/object triples from the exchange and write them to the knowledge graph. Adds ~2-5s per turn. Off by default. Independent of tools.">
                     <input id="t-auto-kg" type="checkbox" />
@@ -295,6 +303,20 @@
                     Show live thinking preview while reasoning
                   </label>
                 </div>
+              </section>
+
+              <section class="advanced-only-section">
+                <h3>Backups</h3>
+                <span class="caption">
+                  Snapshot your palace (drawers + knowledge graph + pending review)
+                  to <code>~/.mempalace/backups/</code>. Use before a bulk import
+                  or a nuke so you can roll back if anything goes wrong.
+                </span>
+                <div class="row" style="margin-top: 8px;gap:8px;align-items:center">
+                  <button id="backup-now-btn" class="primary" type="button" title="Create a timestamped snapshot right now. Copies are plain files you can rsync elsewhere.">Back up now</button>
+                  <span id="backup-status" class="muted" style="font-size:12px"></span>
+                </div>
+                <div id="backup-list" class="muted" style="margin-top:10px;font-size:12px"></div>
               </section>
             </div>
 
@@ -377,7 +399,16 @@
                 <div id="attachments-list"></div>
               </section>
 
-              <section>
+              <section class="advanced-only-teaser" data-pair="import-past-chats">
+                <h3>Import past chats from another AI tool</h3>
+                <span class="caption">
+                  One-time bulk import from Claude / ChatGPT / Slack exports, with LLM-based
+                  topic clustering + review queue. Enable <b>Show advanced features</b> under
+                  Settings → Conversation to reveal.
+                </span>
+              </section>
+
+              <section class="advanced-only-section" data-pair="import-past-chats">
                 <h3>Import past chats from a folder</h3>
                 <span class="caption">
                   Point this at a directory of conversation exports (Claude Code JSONL,
@@ -385,10 +416,43 @@
                   exchange into the current wing. <b>Takes minutes for large folders.</b>
                 </span>
                 <div class="row" style="margin-top: 8px">
-                  <input id="import-convos-path" type="text" placeholder="e.g. ~/Downloads/claude-export" style="flex:1" />
-                  <button id="import-convos-btn" class="primary" type="button">Import</button>
+                  <input id="import-convos-path" type="text" placeholder="pick a folder with Browse, or paste a path to a .json file" style="flex:1" />
+                  <button id="import-browse-btn" class="ghost" type="button" title="Pick an export folder (macOS folder picker). To import a single .json file, paste or type its full path into the input.">Browse…</button>
+                  <button id="import-convos-btn" class="ghost" type="button" title="Old flow: dump everything into the current wing, no classification">Import (flat)</button>
+                  <button id="import-smart-btn" class="primary" type="button" title="Scan the export, use your local LLM to cluster chats into meaningful wings, and let you review before filing">Smart Import</button>
+                </div>
+                <div class="muted" style="font-size:11px;margin-top:4px">
+                  Tip: path box is editable — paste a full path to <code>conversations.json</code> if you want to skip straight to one file.
+                </div>
+                <label style="display:flex;gap:8px;align-items:center;margin-top:8px;font-size:13px;">
+                  <input id="import-extract-general" type="checkbox" />
+                  <span>
+                    Also extract inferred facts (decisions, preferences, milestones) —
+                    these go to <b>Review</b> before saving, so you can catch bad guesses.
+                  </span>
+                </label>
+                <div class="row" style="margin-top:6px;align-items:center;gap:8px;font-size:13px">
+                  <label for="import-classifier-model" style="color:var(--fg-dim)">Smart-import model:</label>
+                  <select id="import-classifier-model" style="flex:0 0 auto;max-width:280px"></select>
+                  <span class="muted" style="font-size:12px">smaller = faster, bigger = better grouping</span>
                 </div>
                 <span id="import-convos-status" class="muted"></span>
+                <div id="import-progress" hidden style="margin-top:8px;padding:10px 12px;border:1px solid #2a2a2a;border-radius:6px;background:var(--bg-3);font-size:13px">
+                  <div style="display:flex;gap:8px;align-items:center">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span id="import-progress-text">classifying…</span>
+                    <span id="import-progress-elapsed" class="muted" style="margin-left:auto">0s</span>
+                    <button id="import-progress-cancel" class="danger" type="button" style="margin-left:8px">Cancel</button>
+                  </div>
+                  <div class="progress-bar" style="margin-top:8px">
+                    <div id="import-progress-fill" class="progress-fill" style="width:0%"></div>
+                  </div>
+                  <div class="muted" style="margin-top:4px;font-size:11px;display:flex;gap:8px">
+                    <span id="import-progress-detail">preparing…</span>
+                    <span class="grow" style="flex:1"></span>
+                    <span id="import-progress-eta"></span>
+                  </div>
+                </div>
               </section>
             </div>
 
@@ -566,18 +630,59 @@
         <header>
           <h2>Memory</h2>
           <div class="tabs" role="tablist">
-            <button class="tab active" data-tab="stats">Stats</button>
-            <button class="tab" data-tab="browser">Browser</button>
-            <button class="tab" data-tab="taxonomy">Taxonomy</button>
-            <button class="tab" data-tab="recent">Recent</button>
-            <button class="tab" data-tab="graph">Graph</button>
-            <button class="tab" data-tab="tunnels">Tunnels</button>
-            <button class="tab" data-tab="diary">Diary</button>
+            <button class="tab active" data-tab="memories" title="All your memories in one list. Search, filter by topic/section, edit, move, or delete. Default tab.">Memories</button>
+            <button class="tab" data-tab="recent" title="Most recently added drawers across all topics — a fast way to see what the assistant just filed.">Recent</button>
+            <button class="tab" data-tab="review" title="Pending inferences from a Smart Import — accept, edit, or reject each one before it lands in the palace.">Review <span id="review-badge" class="tab-badge" hidden></span></button>
+            <button class="tab" data-tab="questions" title="Clarifying questions the import hit (e.g. 'is this the same Kai as in wing_kai?'). Answering one can unblock many pending items.">Questions <span id="questions-badge" class="tab-badge" hidden></span></button>
+            <button class="tab advanced-only" data-tab="stats" title="Palace health: drawer count by wing, collection size, and a 'Refresh from disk' button to re-read after external edits.">Stats</button>
+            <button class="tab advanced-only" data-tab="browser" title="Legacy browser with bulk-select, advanced filters (by date, by wing with room), and detailed metadata.">Browser</button>
+            <button class="tab advanced-only" data-tab="taxonomy" title="Tree view of wings → rooms → drawer counts. Useful for auditing how memories are organized.">Taxonomy</button>
+            <button class="tab advanced-only" data-tab="graph" title="Knowledge-graph view of typed facts (Entity → predicate → Entity) with validity windows. Distinct from drawers — structured facts extracted from conversations.">Graph</button>
+            <button class="tab advanced-only" data-tab="tunnels" title="Cross-wing bridges: explicit links between rooms in different wings, useful when the same topic spans multiple projects or people.">Tunnels</button>
+            <button class="tab advanced-only" data-tab="diary" title="The agent's private journal — first-person reflections written via diary_write. Separate from chat memory.">Diary</button>
           </div>
           <button id="close-memory-modal" class="icon-btn">✕</button>
         </header>
         <div class="settings-body">
-          <div class="tab-pane" data-tab="stats">
+          <div class="tab-pane" data-tab="memories">
+            <div class="memories-toolbar">
+              <input id="memories-search" type="text" placeholder="search memories (semantic)…" title="Semantic search across ALL topics — uses embeddings so it matches meaning, not just keywords. Clears the list filters while active." />
+              <select id="memories-topic-filter" title="Filter the list to a single topic (wing). Shows the drawer count next to each.">
+                <option value="">all topics</option>
+              </select>
+              <input id="memories-section-filter" type="text" placeholder="section filter (optional)" title="Narrow further to a specific section (room) within the chosen topic. Leave blank to show all sections." />
+              <button id="memories-rename-topic" class="ghost" type="button" hidden title="Rename or merge the currently-filtered topic. Every memory under it moves to the new name. Use to merge 'work' + 'work-stuff' into one topic.">rename topic…</button>
+              <button id="memories-refresh" class="ghost" type="button" title="Reload the list from the palace (useful after external edits or CLI changes).">refresh</button>
+            </div>
+            <div id="memories-bulk-bar" class="memories-bulk-bar" hidden>
+              <label class="check" style="margin:0" title="Toggle every visible row on this page">
+                <input id="memories-select-all" type="checkbox" />
+                <span>Select all on page</span>
+              </label>
+              <span id="memories-selected-count" class="muted">0 selected</span>
+              <span class="grow" style="flex:1"></span>
+              <button id="memories-bulk-delete" class="danger" type="button" disabled title="Delete every memory currently checked. Selection is preserved across pages until cleared.">Delete selected</button>
+              <button id="memories-bulk-clear" class="ghost" type="button" disabled title="Uncheck everything without deleting">Clear selection</button>
+              <button id="memories-delete-all" class="danger" type="button" title="Delete every memory matching the current topic/section filter. With no filter, deletes the ENTIRE palace (requires two confirmations).">Delete all matching filter…</button>
+            </div>
+            <div id="memories-list" class="muted" style="margin-top:10px">loading…</div>
+            <div class="memories-pager" style="margin-top:10px;display:flex;gap:8px;align-items:center">
+              <button id="memories-prev" class="ghost" type="button" title="Previous page (30 memories per page)">← prev</button>
+              <span id="memories-page" class="muted"></span>
+              <button id="memories-next" class="ghost" type="button" title="Next page (30 memories per page)">next →</button>
+            </div>
+            <section class="danger-zone">
+              <h3>Danger zone</h3>
+              <p class="muted">
+                Wipe every memory, knowledge-graph fact, and pending-review item
+                from your palace. Doesn't touch your identity, personas, or the
+                snapshots in <code>~/.mempalace/backups/</code>.
+              </p>
+              <button id="memories-nuke-btn" class="danger" type="button" title="Opens a typed-confirmation modal. You must type the exact phrase to enable the wipe button.">Wipe everything…</button>
+            </section>
+          </div>
+
+          <div class="tab-pane" data-tab="stats" hidden>
             <div id="stats-content" class="muted">loading…</div>
             <div class="row" style="margin-top:14px">
               <button id="reconnect-btn" class="ghost" type="button" title="Drops the cached ChromaDB collection in memory and re-reads from disk. Use after editing the palace with the `mempalace` CLI in another terminal — otherwise this UI shows stale data.">Refresh from disk</button>
@@ -755,7 +860,113 @@
             <h4>Recent entries</h4>
             <div id="diary-list"></div>
           </div>
+
+          <div class="tab-pane" data-tab="review" hidden>
+            <p class="muted">
+              Inferences pulled from imported chats that the extractor wasn't willing to
+              auto-commit. Accept, edit, or reject each one — bulk actions work per
+              conversation. Your exact words (verbatim chunks) never land here — they
+              auto-commit during import.
+            </p>
+            <div class="row" style="margin-top: 8px">
+              <button id="review-refresh" class="ghost" type="button">Refresh</button>
+              <span id="review-status" class="muted"></span>
+            </div>
+            <div id="review-list" style="margin-top: 10px"></div>
+          </div>
+
+          <div class="tab-pane" data-tab="questions" hidden>
+            <p class="muted">
+              Ambiguous cases the extractor hit during import — for example, a name
+              that collides with an existing entity in your palace. Answering one can
+              unblock multiple pending memories at once.
+            </p>
+            <div class="row" style="margin-top: 8px">
+              <button id="questions-refresh" class="ghost" type="button">Refresh</button>
+              <span id="questions-status" class="muted"></span>
+            </div>
+            <div id="questions-list" style="margin-top: 10px"></div>
+          </div>
         </div>
+      </div>
+    </div>
+
+    <!-- Danger-zone confirmation modal -->
+    <div id="nuke-overlay" hidden>
+      <div class="settings-panel danger-panel" style="max-width:520px">
+        <header style="border-bottom:1px solid #4b1212">
+          <h2 style="color:#f87171">Wipe everything?</h2>
+          <button id="nuke-close" class="icon-btn">✕</button>
+        </header>
+        <div style="padding:14px 18px">
+          <p style="margin:0 0 10px">
+            This deletes every drawer, every knowledge-graph fact, and every
+            pending-review item.
+            <b>Cannot be undone</b> (unless you restore from a backup snapshot).
+          </p>
+          <p class="muted" style="margin:0 0 10px">Not touched:</p>
+          <ul class="muted" style="margin:0 0 14px 18px;font-size:12px">
+            <li>Your identity / personas / agents</li>
+            <li>MCP configs</li>
+            <li>Palace backups under <code>~/.mempalace/backups/</code></li>
+            <li>Chat sessions (those live in the browser — use New Chat if you want to clear them)</li>
+          </ul>
+          <label style="font-size:13px;display:block;margin-bottom:4px">
+            To confirm, type <code id="nuke-phrase-display">WIPE MY MEMORY</code>:
+          </label>
+          <input id="nuke-input" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="" style="width:100%;padding:8px 10px;background:var(--bg-3);border:1px solid #4b1212;border-radius:6px;color:var(--fg);font-family:ui-monospace,monospace" />
+          <div id="nuke-status" class="muted" style="margin-top:8px;font-size:12px;min-height:16px"></div>
+        </div>
+        <footer style="padding:12px 18px;border-top:1px solid #4b1212;display:flex;gap:8px;justify-content:flex-end">
+          <button id="nuke-cancel" class="ghost" type="button">Cancel</button>
+          <button id="nuke-confirm" class="danger" type="button" disabled>Wipe everything</button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- Smart-import plan review modal -->
+    <div id="import-plan-overlay" hidden>
+      <div class="settings-panel" style="max-width:860px;min-height:420px;max-height:86vh;display:flex;flex-direction:column">
+        <header>
+          <h2>Review import plan</h2>
+          <button id="import-plan-close" class="icon-btn">✕</button>
+        </header>
+        <div id="import-plan-summary" style="padding:10px 16px;border-bottom:1px solid #222;font-size:13px"></div>
+        <div id="import-plan-body" style="padding:10px 16px;overflow:auto;flex:1"></div>
+        <footer style="padding:10px 16px;border-top:1px solid #222;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <label style="display:flex;gap:6px;align-items:center;font-size:13px">
+            <input id="import-plan-review" type="checkbox" checked /> send inferred facts through Review
+          </label>
+          <label style="display:flex;gap:6px;align-items:center;font-size:13px">
+            <input id="import-plan-extract" type="checkbox" /> also extract inferences (decisions / preferences)
+          </label>
+          <span id="import-plan-status" class="muted" style="flex:1"></span>
+          <button id="import-plan-commit" class="primary" type="button">Commit import</button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- Folder picker modal for import -->
+    <div id="fs-picker-overlay" hidden>
+      <div class="settings-panel" style="max-width:640px;min-height:360px">
+        <header>
+          <h2>Pick a folder to import</h2>
+          <button id="fs-picker-close" class="icon-btn">✕</button>
+        </header>
+        <div style="padding:12px 16px;border-bottom:1px solid #222;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+          <div id="fs-crumbs" style="display:flex;gap:4px;flex-wrap:wrap;flex:1;font-size:13px"></div>
+          <label style="display:flex;gap:4px;align-items:center;font-size:12px;color:#888">
+            <input id="fs-show-hidden" type="checkbox" /> show hidden
+          </label>
+        </div>
+        <div style="padding:8px 16px">
+          <div id="fs-entries" class="muted" style="max-height:360px;overflow:auto"></div>
+        </div>
+        <footer style="padding:10px 16px;border-top:1px solid #222;display:flex;gap:8px;align-items:center">
+          <code id="fs-current" class="muted" style="flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis"></code>
+          <button id="fs-pick-current" class="primary" type="button">Pick this folder</button>
+        </footer>
       </div>
     </div>
 

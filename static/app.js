@@ -389,20 +389,23 @@ function renderSessions() {
       });
       item.querySelector(".delete").addEventListener("click", async (e) => {
         e.stopPropagation();
-        const alsoMemory = confirm(
-          `Delete chat "${s.title}"?\n\nOK = also delete its memory drawers\nCancel to abort`,
-        );
-        if (!alsoMemory) return;
-        // Attempt to purge associated drawers. Failure is non-fatal.
-        try {
-          const r = await fetch(`/api/chat-session/${encodeURIComponent(s.id)}`, {
-            method: "DELETE",
-          });
-          if (r.ok) {
-            const d = await r.json();
-            if (d.deleted) setStatus(`removed ${d.deleted} drawers`, "warn");
-          }
-        } catch {}
+        const wantDrawers = e.shiftKey;
+        const promptText = wantDrawers
+          ? `Delete chat "${s.title}" AND all its filed memories?\n\nThis can't be undone.`
+          : `Delete chat "${s.title}"?\n\nFiled memories stay in your palace — they're independent of chat history.\n(Hold Shift while clicking Delete to also wipe the memories.)`;
+        if (!confirm(promptText)) return;
+        if (wantDrawers) {
+          try {
+            const r = await fetch(
+              `/api/chat-session/${encodeURIComponent(s.id)}?drop_memories=true`,
+              { method: "DELETE" },
+            );
+            if (r.ok) {
+              const d = await r.json();
+              if (d.deleted) setStatus(`removed ${d.deleted} memor${d.deleted === 1 ? "y" : "ies"}`, "warn");
+            }
+          } catch {}
+        }
         deleteSession(s.id);
         renderSessions();
         renderMessages();
@@ -731,6 +734,26 @@ function renderMessages() {
           .join("")}</ul>`;
       div.appendChild(ex);
     }
+    if (m.llmSaves && m.llmSaves.length) {
+      const chip = document.createElement("div");
+      chip.className = "save-chip";
+      chip.innerHTML = m.llmSaves
+        .map(
+          (s, i) => {
+            const preview = (s.preview || "").trim();
+            const chipTitle = preview
+              ? `Filed: "${preview}"\n\nHover the 'change' button to move it.`
+              : `Filed to ${s.topic} › ${s.section}`;
+            return `<span class="save-chip-item" data-idx="${i}" title="${escapeHtml(chipTitle)}">📁 Saved to <b>${escapeHtml(s.topic)}</b> › <b>${escapeHtml(s.section)}</b>${
+              s.drawer_id
+                ? ` <button class="save-chip-edit" data-drawer="${escapeHtml(s.drawer_id)}" type="button" title="Move this memory to a different topic/section if the assistant picked the wrong place">change</button>`
+                : ""
+            }</span>`;
+          },
+        )
+        .join("");
+      div.appendChild(chip);
+    }
     els.messages.appendChild(div);
   }
   els.messages.parentElement.scrollTop = els.messages.parentElement.scrollHeight;
@@ -827,6 +850,18 @@ async function loadModels() {
       .join("");
     if (state.prefs.model && state.models.includes(state.prefs.model)) {
       els.model.value = state.prefs.model;
+    } else {
+      // First-run pick: prefer tool-capable models for Auto-file memories.
+      const PREFERRED_DEFAULTS = [
+        "gpt-oss:20b",
+        "deepseek-r1:latest",
+        "qwen3.6:35b-a3b-q4_K_M",
+      ];
+      const pick = PREFERRED_DEFAULTS.find((m) => state.models.includes(m));
+      if (pick) {
+        els.model.value = pick;
+        state.prefs.model = pick;
+      }
     }
     renderEmptyState();
     syncSendDisabled();
@@ -924,9 +959,13 @@ function renderEmptyState() {
   }
 
   // Case 3: ready, just no chat yet — show the Keepers logo + hint
+  const autoFileOn = !!state.prefs?.tools;
+  const hint = autoFileOn
+    ? "Start typing — I'll remember the important bits automatically, sorted into topics you can browse anytime. Drop files anywhere to attach them."
+    : "Send a message to start. Memory recall and save are on by default. Drop files anywhere to attach them to this wing.";
   host.innerHTML = `
     <img src="/static/logo-256.png" alt="Keepers Temple" class="empty-logo" />
-    <div class="empty-hint">Send a message to start. Memory recall and save are on by default. Drop files anywhere to attach them to this wing.</div>
+    <div class="empty-hint">${escapeHtml(hint)}</div>
   `;
 }
 
@@ -1493,7 +1532,16 @@ async function sendMessage(text) {
               asstMsg.kgAdded = evt.kg_added;
               bits.push(`+${evt.kg_added.length} kg triple(s)`);
             }
-            if (evt.saved_drawer_id) bits.unshift("saved");
+            if (evt.llm_saves && evt.llm_saves.length) {
+              // LLM filed the turn itself — surface the chip data on the message.
+              asstMsg.llmSaves = evt.llm_saves;
+              const where = evt.llm_saves
+                .map((s) => `${s.topic} › ${s.section}`)
+                .join(", ");
+              bits.unshift(`saved to ${where}`);
+            } else if (evt.saved_drawer_id) {
+              bits.unshift("saved");
+            }
             if (evt.save_error) {
               setStatus(`save error: ${evt.save_error}`, "warn");
             } else if (bits.length) {
@@ -3231,6 +3279,9 @@ function switchTab(name) {
     if (kgViewMode === "graph") loadKgGraph();
   } else if (name === "tunnels") loadTunnels();
   else if (name === "diary") loadDiary();
+  else if (name === "review") loadReview();
+  else if (name === "questions") loadQuestions();
+  else if (name === "memories") loadMemoriesTab();
 }
 
 /* ─── Knowledge Graph ──────────────────────────────────────────────────── */
@@ -3646,6 +3697,7 @@ document.addEventListener("click", async (e) => {
     const wing = state.prefs.wing || "personal";
     const path = document.getElementById("import-convos-path").value.trim();
     const status = document.getElementById("import-convos-status");
+    const extractGeneral = !!document.getElementById("import-extract-general")?.checked;
     if (!path) {
       status.textContent = "enter a folder path first";
       return;
@@ -3653,17 +3705,29 @@ document.addEventListener("click", async (e) => {
     status.textContent = "importing… (this can take minutes)";
     e.target.disabled = true;
     try {
+      const body = { path };
+      if (extractGeneral) {
+        body.extract = "general";
+        body.review = true;
+      }
       const r = await fetch(
         `/api/wings/${encodeURIComponent(wing)}/import-convos`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path }),
+          body: JSON.stringify(body),
         },
       );
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
-      status.textContent = `imported into ${wing}`;
+      if (extractGeneral) {
+        const pc = d.pending_count ?? 0;
+        const qc = d.questions_count ?? 0;
+        status.innerHTML = `imported into ${wing} — <b>${pc}</b> pending, <b>${qc}</b> questions. Open the Memory modal → Review / Questions.`;
+        refreshReviewBadges();
+      } else {
+        status.textContent = `imported into ${wing}`;
+      }
       loadAttachments();
       loadWings(wing);
     } catch (err) {
@@ -3695,7 +3759,8 @@ document.querySelectorAll(".tab").forEach((t) => {
 
 els.openMemory.addEventListener("click", () => {
   els.memoryOverlay.hidden = false;
-  switchTab("stats");
+  applyAdvancedMode(); // ensure tab visibility reflects current toggle
+  switchTab("memories");
 });
 els.closeMemoryModal.addEventListener("click", () => {
   els.memoryOverlay.hidden = true;
@@ -4149,4 +4214,1513 @@ async function applyUrlParams() {
   els.input.focus();
   // Process URL-driven quick capture last so it sees fully-loaded state.
   await applyUrlParams();
+  refreshReviewBadges();
 })();
+
+/* ─── Filesystem picker (import browse button) ──────────────────────────── */
+
+const fsPicker = {
+  overlay: null,
+  entriesEl: null,
+  crumbsEl: null,
+  currentEl: null,
+  showHidden: false,
+  path: null,
+};
+
+function openFsPicker(startPath) {
+  fsPicker.overlay = document.getElementById("fs-picker-overlay");
+  fsPicker.entriesEl = document.getElementById("fs-entries");
+  fsPicker.crumbsEl = document.getElementById("fs-crumbs");
+  fsPicker.currentEl = document.getElementById("fs-current");
+  if (!fsPicker.overlay) return;
+  fsPicker.overlay.hidden = false;
+  const hidden = document.getElementById("fs-show-hidden");
+  if (hidden) {
+    hidden.checked = fsPicker.showHidden;
+    hidden.onchange = () => {
+      fsPicker.showHidden = !!hidden.checked;
+      renderFsEntries();
+    };
+  }
+  loadFsPath(startPath || "~");
+}
+
+function closeFsPicker() {
+  if (fsPicker.overlay) fsPicker.overlay.hidden = true;
+}
+
+async function loadFsPath(path) {
+  fsPicker.entriesEl.innerHTML = '<div class="muted">loading…</div>';
+  try {
+    const u = new URL("/api/fs/browse", location.origin);
+    if (path) u.searchParams.set("path", path);
+    const r = await fetch(u);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+    fsPicker.path = d.path;
+    fsPicker.entries = d.entries;
+    fsPicker.parent = d.parent;
+    fsPicker.crumbs = d.crumbs;
+    fsPicker.home = d.home;
+    renderFsEntries();
+    renderFsCrumbs();
+    fsPicker.currentEl.textContent = d.path;
+  } catch (err) {
+    fsPicker.entriesEl.innerHTML = `<div class="err">error: ${escHtml(err.message)}</div>`;
+  }
+}
+
+function renderFsEntries() {
+  const parts = [];
+  if (fsPicker.parent) {
+    parts.push(
+      `<div class="fs-entry" data-path="${escHtml(fsPicker.parent)}"><span class="fs-icon">↰</span><span>..</span></div>`,
+    );
+  }
+  const visible = fsPicker.showHidden
+    ? fsPicker.entries
+    : fsPicker.entries.filter((e) => !e.hidden);
+  for (const e of visible) {
+    parts.push(
+      `<div class="fs-entry${e.hidden ? " hidden-dir" : ""}" data-path="${escHtml(e.path)}"><span class="fs-icon">📁</span><span>${escHtml(e.name)}</span></div>`,
+    );
+  }
+  if (!parts.length) {
+    fsPicker.entriesEl.innerHTML = '<div class="muted">(no subfolders)</div>';
+  } else {
+    fsPicker.entriesEl.innerHTML = parts.join("");
+  }
+}
+
+function renderFsCrumbs() {
+  const parts = (fsPicker.crumbs || []).map((c, i, arr) => {
+    const active = i === arr.length - 1 ? " active" : "";
+    return `<button class="fs-crumb${active}" data-path="${escHtml(c.path)}" type="button">${escHtml(c.name)}</button>`;
+  });
+  fsPicker.crumbsEl.innerHTML = parts.join(
+    '<span style="color:#555">/</span>',
+  );
+}
+
+// Direct wiring of static fs-picker controls — bulletproof vs. delegation
+function wireFsPickerControls() {
+  async function nativePickOrFallback(kind, triggerBtn) {
+    const input = document.getElementById("import-convos-path");
+    const prev = triggerBtn.textContent;
+    triggerBtn.disabled = true;
+    triggerBtn.textContent = "opening Finder…";
+    try {
+      const r = await fetch("/api/fs/native-pick", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind }),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        if (d.cancelled) return;
+        if (d.path && input) input.value = d.path;
+        return;
+      }
+      if (r.status !== 501) {
+        const err = await r.json().catch(() => ({}));
+        console.warn("native picker failed, falling back:", err);
+      }
+      if (kind === "folder") {
+        const current = input?.value?.trim();
+        openFsPicker(current || null);
+      } else if (input) {
+        alert("File picker needs macOS native dialog. Not available in this environment.");
+      }
+    } catch (err) {
+      console.warn("native picker error:", err);
+      if (kind === "folder") {
+        const current = input?.value?.trim();
+        openFsPicker(current || null);
+      }
+    } finally {
+      triggerBtn.disabled = false;
+      triggerBtn.textContent = prev;
+    }
+  }
+
+  const browseBtn = document.getElementById("import-browse-btn");
+  if (browseBtn && !browseBtn.dataset.wired) {
+    browseBtn.dataset.wired = "1";
+    browseBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      // Reliable AppleScript folder picker. For single-file imports the user
+      // pastes/types the path into the editable input — macOS doesn't give us
+      // a reliable unified dialog from osascript.
+      nativePickOrFallback("folder", browseBtn);
+    });
+  }
+  const closeBtn = document.getElementById("fs-picker-close");
+  if (closeBtn && !closeBtn.dataset.wired) {
+    closeBtn.dataset.wired = "1";
+    closeBtn.addEventListener("click", closeFsPicker);
+  }
+  const pickBtn = document.getElementById("fs-pick-current");
+  if (pickBtn && !pickBtn.dataset.wired) {
+    pickBtn.dataset.wired = "1";
+    pickBtn.addEventListener("click", () => {
+      const input = document.getElementById("import-convos-path");
+      if (input && fsPicker.path) input.value = fsPicker.path;
+      closeFsPicker();
+    });
+  }
+  const overlay = document.getElementById("fs-picker-overlay");
+  if (overlay && !overlay.dataset.wired) {
+    overlay.dataset.wired = "1";
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) closeFsPicker();
+    });
+  }
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", wireFsPickerControls);
+} else {
+  wireFsPickerControls();
+}
+
+// Delegated click handler for dynamic entries + crumbs inside the picker
+document.addEventListener("click", (e) => {
+  if (!fsPicker.overlay || fsPicker.overlay.hidden) return;
+  const entry = e.target.closest?.(".fs-entry");
+  if (entry) {
+    const p = entry.dataset.path;
+    if (p) loadFsPath(p);
+    return;
+  }
+  const crumb = e.target.closest?.(".fs-crumb");
+  if (crumb) {
+    const p = crumb.dataset.path;
+    if (p) loadFsPath(p);
+  }
+});
+
+/* ─── Smart Import (LLM wing classifier) ───────────────────────────────── */
+
+const smartImport = {
+  path: null,
+  plan: null,
+  titles: {},
+  summaries: {},
+};
+
+async function populateClassifierModels() {
+  const select = document.getElementById("import-classifier-model");
+  if (!select || select.dataset.loaded) return;
+  try {
+    const r = await fetch("/api/models");
+    const d = await r.json();
+    const models = (d.models || []).map((m) => m.name || m);
+    select.innerHTML = models
+      .map((m) => `<option value="${escHtml(m)}">${escHtml(m)}</option>`)
+      .join("");
+    // Prefer a fast small model if one is installed
+    const preferred = [
+      "igorls/gemma-4-E4B-it-heretic-GGUF:latest",
+      "gemma4:26b",
+      "gpt-oss:20b",
+    ];
+    for (const p of preferred) {
+      if (models.includes(p)) {
+        select.value = p;
+        break;
+      }
+    }
+    select.dataset.loaded = "1";
+  } catch {}
+}
+
+function wireSmartImport() {
+  const btn = document.getElementById("import-smart-btn");
+  populateClassifierModels();
+  if (btn && !btn.dataset.wired) {
+    btn.dataset.wired = "1";
+    btn.addEventListener("click", async () => {
+      const path = document.getElementById("import-convos-path")?.value?.trim();
+      const status = document.getElementById("import-convos-status");
+      const modelSel = document.getElementById("import-classifier-model");
+      const model = modelSel?.value || null;
+      if (!path) {
+        if (status) status.textContent = "pick a folder first";
+        return;
+      }
+      btn.disabled = true;
+      const prev = btn.textContent;
+      btn.textContent = "classifying…";
+      if (status) status.textContent = "";
+
+      const progress = document.getElementById("import-progress");
+      const progressText = document.getElementById("import-progress-text");
+      const elapsed = document.getElementById("import-progress-elapsed");
+      const cancelBtn = document.getElementById("import-progress-cancel");
+      if (progress) progress.hidden = false;
+      if (progressText) {
+        progressText.textContent = `scanning export + classifying via ${model || "default model"}…`;
+      }
+      const startedAt = Date.now();
+      if (elapsed) elapsed.textContent = "0s";
+      const timer = setInterval(() => {
+        if (!elapsed) return;
+        const s = Math.floor((Date.now() - startedAt) / 1000);
+        const m = Math.floor(s / 60);
+        elapsed.textContent = m ? `${m}m ${s % 60}s` : `${s}s`;
+      }, 1000);
+
+      const controller = new AbortController();
+      if (cancelBtn) {
+        cancelBtn.onclick = () => {
+          controller.abort();
+          if (progressText) progressText.textContent = "cancelled.";
+        };
+      }
+
+      const fill = document.getElementById("import-progress-fill");
+      const detail = document.getElementById("import-progress-detail");
+      const eta = document.getElementById("import-progress-eta");
+      if (fill) {
+        fill.style.width = "0%";
+        fill.classList.add("indeterminate");
+      }
+
+      try {
+        const r = await fetch("/api/imports/plan/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+          body: JSON.stringify({ path, model }),
+          signal: controller.signal,
+        });
+        if (!r.ok) {
+          const txt = await r.text();
+          throw new Error(`HTTP ${r.status}: ${txt.slice(0, 300)}`);
+        }
+        const reader = r.body.getReader();
+        const dec = new TextDecoder();
+        let buf = "";
+        let approxTotal = 0;
+        let lastBytes = 0;
+        let bytesStartedAt = 0;
+        let terminal = null;
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          // SSE frames separated by blank lines
+          let idx;
+          while ((idx = buf.indexOf("\n\n")) !== -1) {
+            const frame = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            for (const line of frame.split("\n")) {
+              if (!line.startsWith("data:")) continue;
+              const payload = line.slice(5).trim();
+              if (!payload) continue;
+              let evt;
+              try { evt = JSON.parse(payload); }
+              catch { continue; }
+              if (evt.type === "phase") {
+                if (progressText) progressText.textContent = evt.label || "working…";
+                if (detail) detail.textContent = evt.label || "";
+                if (evt.approx_total) {
+                  approxTotal = evt.approx_total;
+                  bytesStartedAt = Date.now();
+                  if (fill) {
+                    fill.classList.remove("indeterminate");
+                    fill.style.width = "0%";
+                  }
+                }
+              } else if (evt.type === "progress") {
+                const b = evt.bytes || 0;
+                lastBytes = b;
+                if (approxTotal && fill) {
+                  const pct = Math.min(99, Math.round((b / approxTotal) * 100));
+                  fill.style.width = pct + "%";
+                }
+                if (detail) detail.textContent = `generating… ${b.toLocaleString()} bytes`;
+                if (eta && bytesStartedAt && b > 200) {
+                  const elapsedMs = Date.now() - bytesStartedAt;
+                  const rate = b / (elapsedMs / 1000);
+                  const remaining = Math.max(0, approxTotal - b);
+                  const secsLeft = rate > 1 ? Math.ceil(remaining / rate) : 0;
+                  eta.textContent = secsLeft > 0
+                    ? `~${secsLeft > 60 ? Math.ceil(secsLeft / 60) + "m" : secsLeft + "s"} remaining (rough)`
+                    : "";
+                }
+              } else if (evt.type === "done") {
+                terminal = { ok: true, payload: evt.payload };
+              } else if (evt.type === "error") {
+                terminal = { ok: false, message: evt.message };
+              }
+            }
+          }
+        }
+        if (!terminal) throw new Error("stream ended without a terminal event");
+        if (!terminal.ok) throw new Error(terminal.message || "unknown error");
+        if (fill) fill.style.width = "100%";
+        const d = terminal.payload;
+        smartImport.path = d.path;
+        smartImport.plan = d.plan;
+        smartImport.titles = d.titles || {};
+        smartImport.summaries = d.summaries || {};
+        renderImportPlan(d);
+        if (status) status.textContent = "";
+      } catch (err) {
+        if (err.name === "AbortError") {
+          if (status) status.textContent = "cancelled (server request may still drain)";
+        } else {
+          if (status) status.textContent = `error: ${err.message}`;
+          console.error(err);
+        }
+      } finally {
+        clearInterval(timer);
+        btn.disabled = false;
+        btn.textContent = prev;
+        if (progress) setTimeout(() => (progress.hidden = true), 400);
+      }
+    });
+  }
+  const closeBtn = document.getElementById("import-plan-close");
+  if (closeBtn && !closeBtn.dataset.wired) {
+    closeBtn.dataset.wired = "1";
+    closeBtn.addEventListener("click", () => {
+      document.getElementById("import-plan-overlay").hidden = true;
+    });
+  }
+  const overlay = document.getElementById("import-plan-overlay");
+  if (overlay && !overlay.dataset.wired) {
+    overlay.dataset.wired = "1";
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) overlay.hidden = true;
+    });
+  }
+  const commit = document.getElementById("import-plan-commit");
+  if (commit && !commit.dataset.wired) {
+    commit.dataset.wired = "1";
+    commit.addEventListener("click", commitImportPlan);
+  }
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", wireSmartImport);
+} else {
+  wireSmartImport();
+}
+
+function renderImportPlan(d) {
+  const overlay = document.getElementById("import-plan-overlay");
+  const summary = document.getElementById("import-plan-summary");
+  const body = document.getElementById("import-plan-body");
+  if (!overlay || !summary || !body) return;
+
+  const skipped = d.skipped || [];
+  const meta = d.metadata_files || [];
+  summary.innerHTML = `
+    <div><b>${d.convos_total}</b> conversations found in <code>${escHtml(d.path)}</code></div>
+    <div class="muted" style="margin-top:4px">
+      Classifier: <code>${escHtml(d.model_used)}</code> ·
+      Existing wings considered: ${(d.existing_wings || []).length
+        ? (d.existing_wings || []).map(escHtml).join(", ")
+        : "(none)"} ·
+      Metadata files set aside: ${meta.length ? meta.map((m) => escHtml(m.name)).join(", ") : "(none)"} ·
+      Skipped: ${skipped.length}
+    </div>`;
+
+  const parts = [];
+  (d.plan || []).forEach((wing, idx) => {
+    const sampleIds = wing.convo_ids.slice(0, 8);
+    parts.push(`
+      <div class="plan-wing" data-idx="${idx}">
+        <div class="plan-wing-head">
+          <input class="plan-wing-name" data-idx="${idx}" value="${escHtml(wing.name)}" />
+          <span class="plan-wing-count"><b>${wing.convo_ids.length}</b> conversations</span>
+          <span class="grow" style="flex:1"></span>
+          <button class="ghost plan-wing-drop" data-idx="${idx}" type="button" title="Exclude this wing from commit">Drop</button>
+        </div>
+        <div class="plan-wing-desc">${escHtml(wing.description || "")}</div>
+        <div class="plan-wing-convos">
+          <details>
+            <summary>show ${wing.convo_ids.length} titles</summary>
+            <ul>${wing.convo_ids
+              .map((id) => `<li>${escHtml(smartImport.titles[id] || id)}</li>`)
+              .join("")}</ul>
+          </details>
+        </div>
+      </div>`);
+  });
+  body.innerHTML = parts.join("") || '<div class="muted">(empty plan)</div>';
+  overlay.hidden = false;
+
+  // Wire per-wing controls
+  body.querySelectorAll(".plan-wing-drop").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = Number(btn.dataset.idx);
+      smartImport.plan[idx] = null;
+      btn.closest(".plan-wing").remove();
+    });
+  });
+  body.querySelectorAll(".plan-wing-name").forEach((inp) => {
+    inp.addEventListener("change", () => {
+      const idx = Number(inp.dataset.idx);
+      const v = inp.value.trim().toLowerCase().replace(/\s+/g, "-");
+      inp.value = v;
+      if (smartImport.plan[idx]) smartImport.plan[idx].name = v;
+    });
+  });
+}
+
+async function commitImportPlan() {
+  const status = document.getElementById("import-plan-status");
+  const extractBox = document.getElementById("import-plan-extract");
+  const reviewBox = document.getElementById("import-plan-review");
+  const btn = document.getElementById("import-plan-commit");
+  if (!smartImport.path || !smartImport.plan) return;
+  const plan = smartImport.plan.filter((w) => w && w.convo_ids && w.convo_ids.length);
+  if (!plan.length) {
+    status.textContent = "plan is empty";
+    return;
+  }
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = "committing…";
+  if (status) status.textContent = "writing to palace…";
+  try {
+    const body = {
+      path: smartImport.path,
+      plan,
+      review: !!reviewBox?.checked,
+    };
+    if (extractBox?.checked) body.extract = "general";
+    const r = await fetch("/api/imports/commit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+    const perWingSummary = (d.per_wing || [])
+      .map((w) => `${w.wing}: ${w.committed} committed${w.pending ? `, ${w.pending} pending` : ""}`)
+      .join(" · ");
+    status.innerHTML = `<b>Done.</b> ${d.total_committed} committed, ${d.total_pending} pending. ${escHtml(perWingSummary)}`;
+    refreshReviewBadges();
+    loadWings();
+  } catch (err) {
+    status.textContent = `error: ${err.message}`;
+    console.error(err);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prev;
+  }
+}
+
+/* ─── Review + Questions (import-time gate) ─────────────────────────────── */
+
+function escHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+async function refreshReviewBadges() {
+  try {
+    const [rv, qs] = await Promise.all([
+      fetch("/api/review?limit=1").then((r) => r.json()),
+      fetch("/api/questions").then((r) => r.json()),
+    ]);
+    const rBadge = document.getElementById("review-badge");
+    const qBadge = document.getElementById("questions-badge");
+    if (rBadge) {
+      if (rv.total > 0) {
+        rBadge.textContent = rv.total;
+        rBadge.hidden = false;
+      } else rBadge.hidden = true;
+    }
+    if (qBadge) {
+      if (qs.total > 0) {
+        qBadge.textContent = qs.total;
+        qBadge.hidden = false;
+      } else qBadge.hidden = true;
+    }
+  } catch {}
+}
+
+async function loadReview() {
+  const list = document.getElementById("review-list");
+  const status = document.getElementById("review-status");
+  if (!list) return;
+  list.innerHTML = '<div class="muted">loading…</div>';
+  if (status) status.textContent = "";
+  try {
+    const [bucketsR, itemsR] = await Promise.all([
+      fetch("/api/review/sources").then((r) => r.json()),
+      fetch("/api/review?limit=500").then((r) => r.json()),
+    ]);
+    const buckets = bucketsR.sources || [];
+    const items = itemsR.items || [];
+    const total = itemsR.total || 0;
+    if (!total) {
+      list.innerHTML =
+        '<div class="muted">No pending inferences. Import a chat export with “extract inferred facts” enabled to populate this list.</div>';
+      return;
+    }
+    const bySrc = new Map();
+    for (const b of buckets) bySrc.set(b.source, []);
+    for (const it of items) {
+      const k = it.source_conversation || "(unknown)";
+      if (!bySrc.has(k)) bySrc.set(k, []);
+      bySrc.get(k).push(it);
+    }
+    const parts = [];
+    parts.push(
+      `<div class="muted" style="margin-bottom:10px"><b>${total}</b> pending across <b>${bySrc.size}</b> conversations</div>`,
+    );
+    for (const [src, rows] of bySrc) {
+      const sid = `src-${btoa(src).replace(/[^a-zA-Z0-9]/g, "")}`;
+      parts.push(`
+        <section class="review-bucket" style="border:1px solid #2a2a2a;border-radius:8px;margin-bottom:12px;padding:10px">
+          <header style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <b>${escHtml(src)}</b>
+            <span class="muted">${rows.length} pending</span>
+            <span class="grow" style="flex:1"></span>
+            <button class="ghost bulk-accept" data-src="${escHtml(src)}" type="button">Accept all</button>
+            <button class="danger bulk-reject" data-src="${escHtml(src)}" type="button">Reject all</button>
+          </header>
+          <div id="${sid}" class="review-rows" style="margin-top:8px"></div>
+        </section>`);
+    }
+    list.innerHTML = parts.join("");
+    for (const [src, rows] of bySrc) {
+      const sid = `src-${btoa(src).replace(/[^a-zA-Z0-9]/g, "")}`;
+      const host = document.getElementById(sid);
+      host.innerHTML = rows
+        .map((r) => renderReviewRow(r))
+        .join("");
+    }
+  } catch (err) {
+    list.innerHTML = `<div class="err">error: ${escHtml(err.message)}</div>`;
+  }
+}
+
+function renderReviewRow(r) {
+  const score = r.keyword_score != null ? Number(r.keyword_score).toFixed(1) : "—";
+  return `
+    <div class="review-row" data-id="${escHtml(r.id)}" style="border-top:1px solid #222;padding:8px 0">
+      <div class="row" style="gap:6px;align-items:center">
+        <span class="muted" title="keyword-density score from extractor; higher = more marker words">kw ${score}</span>
+        <code class="muted">${escHtml(r.proposed_wing)} › ${escHtml(r.proposed_room)}</code>
+        <span class="grow" style="flex:1"></span>
+        <button class="primary act-accept" type="button">Accept</button>
+        <button class="ghost act-edit" type="button">Edit</button>
+        <button class="danger act-reject" type="button">Reject</button>
+      </div>
+      <div class="review-content" style="margin-top:6px;white-space:pre-wrap;font-size:13px">${escHtml(r.content)}</div>
+      <div class="review-edit" hidden style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
+        <input class="edit-wing" value="${escHtml(r.proposed_wing)}" style="width:140px" />
+        <input class="edit-room" value="${escHtml(r.proposed_room)}" style="width:160px" />
+        <textarea class="edit-content" style="flex:1;min-width:200px;min-height:60px">${escHtml(r.content)}</textarea>
+        <button class="primary act-save-edit" type="button">Save + Accept</button>
+      </div>
+    </div>`;
+}
+
+document.addEventListener("click", async (e) => {
+  const row = e.target.closest?.(".review-row");
+  const bucket = e.target.closest?.(".review-bucket");
+
+  if (e.target.classList?.contains("bulk-accept") && bucket) {
+    const src = e.target.dataset.src;
+    if (!confirm(`Accept ALL pending memories from "${src}"?`)) return;
+    e.target.disabled = true;
+    try {
+      const r = await fetch("/api/review/bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source: src, action: "accept" }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      await loadReview();
+      refreshReviewBadges();
+    } catch (err) {
+      alert("error: " + err.message);
+    } finally {
+      e.target.disabled = false;
+    }
+    return;
+  }
+  if (e.target.classList?.contains("bulk-reject") && bucket) {
+    const src = e.target.dataset.src;
+    if (!confirm(`Reject ALL pending memories from "${src}"?`)) return;
+    e.target.disabled = true;
+    try {
+      const r = await fetch("/api/review/bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source: src, action: "reject" }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      await loadReview();
+      refreshReviewBadges();
+    } catch (err) {
+      alert("error: " + err.message);
+    } finally {
+      e.target.disabled = false;
+    }
+    return;
+  }
+
+  if (!row) return;
+  const id = row.dataset.id;
+
+  if (e.target.classList?.contains("act-accept")) {
+    e.target.disabled = true;
+    try {
+      const r = await fetch(`/api/review/${encodeURIComponent(id)}/accept`, {
+        method: "POST",
+      });
+      if (!r.ok) throw new Error(await r.text());
+      row.remove();
+      refreshReviewBadges();
+    } catch (err) {
+      alert("accept failed: " + err.message);
+    } finally {
+      e.target.disabled = false;
+    }
+  } else if (e.target.classList?.contains("act-reject")) {
+    e.target.disabled = true;
+    try {
+      const r = await fetch(`/api/review/${encodeURIComponent(id)}/reject`, {
+        method: "POST",
+      });
+      if (!r.ok) throw new Error(await r.text());
+      row.remove();
+      refreshReviewBadges();
+    } catch (err) {
+      alert("reject failed: " + err.message);
+    } finally {
+      e.target.disabled = false;
+    }
+  } else if (e.target.classList?.contains("act-edit")) {
+    const panel = row.querySelector(".review-edit");
+    if (panel) panel.hidden = !panel.hidden;
+  } else if (e.target.classList?.contains("act-save-edit")) {
+    const wing = row.querySelector(".edit-wing").value.trim();
+    const roomVal = row.querySelector(".edit-room").value.trim();
+    const content = row.querySelector(".edit-content").value;
+    e.target.disabled = true;
+    try {
+      const er = await fetch(`/api/review/${encodeURIComponent(id)}/edit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ wing, room: roomVal, content }),
+      });
+      if (!er.ok) throw new Error(await er.text());
+      const ar = await fetch(`/api/review/${encodeURIComponent(id)}/accept`, {
+        method: "POST",
+      });
+      if (!ar.ok) throw new Error(await ar.text());
+      row.remove();
+      refreshReviewBadges();
+    } catch (err) {
+      alert("save+accept failed: " + err.message);
+    } finally {
+      e.target.disabled = false;
+    }
+  }
+});
+
+document.addEventListener("click", (e) => {
+  if (e.target.id === "review-refresh") loadReview();
+  if (e.target.id === "questions-refresh") loadQuestions();
+  if (e.target.classList?.contains("save-chip-edit")) {
+    const drawerId = e.target.dataset.drawer;
+    if (!drawerId) return;
+    const newTopic = prompt("Move to topic (lowercase, hyphenated). Leave blank to keep current.");
+    if (newTopic === null) return;
+    const newSection = prompt("Move to section (lowercase, hyphenated). Leave blank to keep current.");
+    if (newSection === null) return;
+    const body = {};
+    if (newTopic && newTopic.trim()) body.topic = newTopic.trim().toLowerCase().replace(/\s+/g, "-");
+    if (newSection && newSection.trim()) body.section = newSection.trim().toLowerCase().replace(/\s+/g, "-");
+    if (!body.topic && !body.section) return;
+    fetch(`/api/drawers/${encodeURIComponent(drawerId)}/move`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+      .then(async (r) => {
+        if (!r.ok) throw new Error(await r.text());
+        const d = await r.json();
+        e.target.closest(".save-chip-item").innerHTML =
+          `📁 Moved to <b>${d.topic || "?"}</b> › <b>${d.section || "?"}</b>`;
+      })
+      .catch((err) => alert("move failed: " + err.message));
+  }
+});
+
+async function loadQuestions() {
+  const list = document.getElementById("questions-list");
+  if (!list) return;
+  list.innerHTML = '<div class="muted">loading…</div>';
+  try {
+    const r = await fetch("/api/questions");
+    const d = await r.json();
+    const items = d.items || [];
+    if (!items.length) {
+      list.innerHTML =
+        '<div class="muted">No open questions.</div>';
+      return;
+    }
+    list.innerHTML = items.map((q) => renderQuestion(q)).join("");
+  } catch (err) {
+    list.innerHTML = `<div class="err">error: ${escHtml(err.message)}</div>`;
+  }
+}
+
+function renderQuestion(q) {
+  const blocks = (q.blocks_pending_ids || []).length;
+  const answers = (q.proposed_answers || []).map(
+    (a, i) =>
+      `<label style="display:flex;gap:6px;align-items:center"><input type="radio" name="qa-${q.id}" value="${escHtml(a)}" /> ${escHtml(a)}</label>`,
+  ).join("");
+  return `
+    <section class="question-row" data-id="${escHtml(q.id)}" style="border:1px solid #2a2a2a;border-radius:8px;padding:10px;margin-bottom:10px">
+      <div><b>${escHtml(q.question)}</b></div>
+      ${blocks ? `<div class="muted" style="font-size:12px;margin-top:4px">Answering unblocks ${blocks} pending memories.</div>` : ""}
+      ${q.context ? `<pre style="white-space:pre-wrap;font-size:12px;margin-top:8px;color:#aaa">${escHtml(q.context)}</pre>` : ""}
+      <div style="display:flex;flex-direction:column;gap:4px;margin-top:8px">${answers}</div>
+      <div class="row" style="gap:6px;margin-top:8px;align-items:center">
+        <input class="qa-freeform" type="text" placeholder="Or type a custom answer…" style="flex:1" />
+        <button class="primary qa-submit" type="button">Submit</button>
+        <button class="ghost qa-skip" type="button">Skip</button>
+      </div>
+    </section>`;
+}
+
+document.addEventListener("click", async (e) => {
+  const row = e.target.closest?.(".question-row");
+  if (!row) return;
+  const id = row.dataset.id;
+
+  if (e.target.classList?.contains("qa-submit")) {
+    const radios = row.querySelectorAll(`input[name="qa-${id}"]`);
+    let picked = "";
+    radios.forEach((r) => {
+      if (r.checked) picked = r.value;
+    });
+    const freeform = row.querySelector(".qa-freeform").value.trim();
+    const answer = freeform || picked;
+    if (!answer) {
+      alert("pick an option or type an answer");
+      return;
+    }
+    e.target.disabled = true;
+    try {
+      const r = await fetch(`/api/questions/${encodeURIComponent(id)}/answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answer }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      row.remove();
+      refreshReviewBadges();
+    } catch (err) {
+      alert("submit failed: " + err.message);
+    } finally {
+      e.target.disabled = false;
+    }
+  } else if (e.target.classList?.contains("qa-skip")) {
+    e.target.disabled = true;
+    try {
+      const r = await fetch(`/api/questions/${encodeURIComponent(id)}/skip`, {
+        method: "POST",
+      });
+      if (!r.ok) throw new Error(await r.text());
+      row.remove();
+      refreshReviewBadges();
+    } catch (err) {
+      alert("skip failed: " + err.message);
+    } finally {
+      e.target.disabled = false;
+    }
+  }
+});
+
+/* ─── Advanced mode (hide developer tabs by default) ────────────────────── */
+
+const ADVANCED_KEY = "kt.advancedMode";
+
+function isAdvancedMode() {
+  return localStorage.getItem(ADVANCED_KEY) === "on";
+}
+
+function applyAdvancedMode() {
+  const on = isAdvancedMode();
+  document.querySelectorAll(".tab.advanced-only").forEach((el) => {
+    el.hidden = !on;
+  });
+  // Sections that only appear in advanced mode (e.g. the full Import UI).
+  document.querySelectorAll(".advanced-only-section").forEach((el) => {
+    el.hidden = !on;
+  });
+  // Paired teaser shown in place of a hidden section when advanced is off.
+  document.querySelectorAll(".advanced-only-teaser").forEach((el) => {
+    el.hidden = on;
+  });
+  const toggle = document.getElementById("t-advanced");
+  if (toggle) toggle.checked = on;
+  // If advanced is off and the currently-active tab is advanced-only,
+  // snap back to the Memories tab.
+  const active = document.querySelector(".tab.active");
+  if (!on && active?.classList?.contains("advanced-only")) {
+    switchTab("memories");
+  }
+}
+
+document.addEventListener("change", (e) => {
+  if (e.target && e.target.id === "t-advanced") {
+    localStorage.setItem(ADVANCED_KEY, e.target.checked ? "on" : "off");
+    applyAdvancedMode();
+  }
+});
+
+// Apply on initial load, and whenever the Memory overlay opens.
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", applyAdvancedMode);
+} else {
+  applyAdvancedMode();
+}
+
+/* ─── Memories tab (unified list + search + edit/move/delete) ───────────── */
+
+const memoriesState = {
+  query: "",
+  topic: "",
+  section: "",
+  limit: 30,
+  offset: 0,
+  total: 0,
+  mode: "list", // "list" | "search"
+  selected: new Set(),
+};
+
+function wireMemoriesTab() {
+  const search = document.getElementById("memories-search");
+  if (search && !search.dataset.wired) {
+    search.dataset.wired = "1";
+    let timer = null;
+    search.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        memoriesState.query = search.value.trim();
+        memoriesState.offset = 0;
+        memoriesState.mode = memoriesState.query ? "search" : "list";
+        loadMemoriesTab();
+      }, 250);
+    });
+  }
+  const topicSel = document.getElementById("memories-topic-filter");
+  if (topicSel && !topicSel.dataset.wired) {
+    topicSel.dataset.wired = "1";
+    topicSel.addEventListener("change", () => {
+      memoriesState.topic = topicSel.value;
+      memoriesState.offset = 0;
+      loadMemoriesTab();
+    });
+  }
+  const sectionInp = document.getElementById("memories-section-filter");
+  if (sectionInp && !sectionInp.dataset.wired) {
+    sectionInp.dataset.wired = "1";
+    let t2 = null;
+    sectionInp.addEventListener("input", () => {
+      clearTimeout(t2);
+      t2 = setTimeout(() => {
+        memoriesState.section = sectionInp.value.trim();
+        memoriesState.offset = 0;
+        loadMemoriesTab();
+      }, 250);
+    });
+  }
+  const refresh = document.getElementById("memories-refresh");
+  if (refresh && !refresh.dataset.wired) {
+    refresh.dataset.wired = "1";
+    refresh.addEventListener("click", () => loadMemoriesTab(true));
+  }
+  const rename = document.getElementById("memories-rename-topic");
+  if (rename && !rename.dataset.wired) {
+    rename.dataset.wired = "1";
+    rename.addEventListener("click", async () => {
+      const fromTopic = memoriesState.topic;
+      if (!fromTopic) return;
+      const to = prompt(
+        `Rename topic "${fromTopic}" to what?\n\n` +
+          `Every memory under it will move to the new name.\n` +
+          `To merge with an existing topic, type that exact name.\n` +
+          `(lowercase, hyphenated — no spaces)`,
+        fromTopic,
+      );
+      if (!to || !to.trim()) return;
+      const toClean = to.trim().toLowerCase().replace(/\s+/g, "-");
+      if (toClean === fromTopic) return;
+      rename.disabled = true;
+      try {
+        const r = await fetch("/api/memories/rename-topic", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ from_topic: fromTopic, to_topic: toClean }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+        alert(`Moved ${d.moved} memor${d.moved === 1 ? "y" : "ies"} to "${toClean}".`);
+        memoriesState.topic = toClean;
+        memoriesState.offset = 0;
+        memoriesState.selected.clear();
+        loadMemoriesTab(true);
+      } catch (err) {
+        alert("rename failed: " + err.message);
+      } finally {
+        rename.disabled = false;
+      }
+    });
+  }
+  const prev = document.getElementById("memories-prev");
+  if (prev && !prev.dataset.wired) {
+    prev.dataset.wired = "1";
+    prev.addEventListener("click", () => {
+      memoriesState.offset = Math.max(0, memoriesState.offset - memoriesState.limit);
+      loadMemoriesTab();
+    });
+  }
+  const next = document.getElementById("memories-next");
+  if (next && !next.dataset.wired) {
+    next.dataset.wired = "1";
+    next.addEventListener("click", () => {
+      memoriesState.offset += memoriesState.limit;
+      loadMemoriesTab();
+    });
+  }
+}
+
+async function populateMemoriesTopics() {
+  const sel = document.getElementById("memories-topic-filter");
+  if (!sel) return;
+  try {
+    const r = await fetch("/api/memories/topics");
+    const d = await r.json();
+    const current = sel.value;
+    sel.innerHTML = '<option value="">all topics</option>';
+    for (const t of d.topics || []) {
+      const opt = document.createElement("option");
+      opt.value = t.topic;
+      opt.textContent = `${t.topic} (${t.count})`;
+      sel.appendChild(opt);
+    }
+    sel.value = current;
+  } catch {}
+  // Show/hide rename button based on whether a topic is currently filtered
+  const renameBtn = document.getElementById("memories-rename-topic");
+  if (renameBtn) renameBtn.hidden = !memoriesState.topic;
+}
+
+async function loadMemoriesTab(forceRefresh) {
+  wireMemoriesTab();
+  const list = document.getElementById("memories-list");
+  const page = document.getElementById("memories-page");
+  if (!list) return;
+  if (forceRefresh) {
+    memoriesState.offset = 0;
+  }
+  await populateMemoriesTopics();
+  list.textContent = "loading…";
+  try {
+    let items = [];
+    let total = 0;
+    if (memoriesState.mode === "search" && memoriesState.query) {
+      const u = new URL("/api/memories/search", location.origin);
+      u.searchParams.set("q", memoriesState.query);
+      if (memoriesState.topic) u.searchParams.set("topic", memoriesState.topic);
+      u.searchParams.set("n", "50");
+      const r = await fetch(u);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+      items = d.items || [];
+      total = items.length;
+    } else {
+      const u = new URL("/api/memories/list", location.origin);
+      if (memoriesState.topic) u.searchParams.set("topic", memoriesState.topic);
+      if (memoriesState.section) u.searchParams.set("section", memoriesState.section);
+      u.searchParams.set("limit", String(memoriesState.limit));
+      u.searchParams.set("offset", String(memoriesState.offset));
+      const r = await fetch(u);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+      items = d.items || [];
+      total = d.total || items.length;
+    }
+    memoriesState.total = total;
+
+    if (!items.length) {
+      list.innerHTML =
+        '<div class="muted" style="padding:12px">no memories match the current filters.</div>';
+    } else {
+      list.innerHTML = items.map(renderMemoryRow).join("");
+    }
+    updateMemoriesBulkBar();
+
+    if (page) {
+      if (memoriesState.mode === "search") {
+        page.textContent = `${items.length} result${items.length === 1 ? "" : "s"} for "${memoriesState.query}"`;
+      } else {
+        const start = memoriesState.offset + (items.length ? 1 : 0);
+        const end = memoriesState.offset + items.length;
+        page.textContent = `${start}–${end} of ${total}`;
+      }
+    }
+    const prev = document.getElementById("memories-prev");
+    const next = document.getElementById("memories-next");
+    const canPaginate = memoriesState.mode === "list";
+    if (prev) prev.disabled = !canPaginate || memoriesState.offset === 0;
+    if (next) next.disabled =
+      !canPaginate ||
+      memoriesState.offset + memoriesState.limit >= memoriesState.total;
+  } catch (err) {
+    list.innerHTML = `<div class="err" style="padding:12px">error: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function formatRelativeTime(iso) {
+  if (!iso) return "";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "";
+  const now = Date.now();
+  const s = Math.round((now - t) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  if (s < 604800) return `${Math.floor(s / 86400)}d ago`;
+  const d = new Date(t);
+  const yr = d.getFullYear();
+  const nowYr = new Date().getFullYear();
+  const month = d.toLocaleString(undefined, { month: "short" });
+  const day = d.getDate();
+  return yr === nowYr ? `${month} ${day}` : `${month} ${day}, ${yr}`;
+}
+
+function renderMemoryRow(item) {
+  const id = item.drawer_id || item.id || "";
+  const topic = item.wing || "?";
+  const section = item.room || "?";
+  const preview = item.content_preview || item.content || "";
+  const sim =
+    item.similarity != null ? `<span class="muted">sim ${Number(item.similarity).toFixed(2)}</span>` : "";
+  const when = formatRelativeTime(item.filed_at);
+  const whenHtml = when
+    ? `<span class="memory-when muted" title="${escapeHtml(item.filed_at || "")}">${escapeHtml(when)}</span>`
+    : "";
+  const checked = memoriesState.selected.has(id) ? "checked" : "";
+  return `
+    <div class="memory-row" data-id="${escapeHtml(id)}">
+      <div class="memory-head">
+        <input type="checkbox" class="memory-pick" title="Select this memory for bulk actions" ${checked} />
+        <code class="memory-loc" title="topic › section — where this memory is filed">${escapeHtml(topic)} › ${escapeHtml(section)}</code>
+        ${whenHtml}
+        ${sim}
+        <span class="grow" style="flex:1"></span>
+        <button class="ghost memory-edit" type="button" title="Edit the content of this memory in place (no topic/section change)">Edit</button>
+        <button class="ghost memory-move" type="button" title="Move this memory to a different topic and/or section">Move</button>
+        <button class="danger memory-delete" type="button" title="Delete this single memory — cannot be undone">Delete</button>
+      </div>
+      <div class="memory-body">${escapeHtml(preview)}</div>
+      <div class="memory-edit-form" hidden>
+        <textarea class="memory-edit-content" rows="4">${escapeHtml(preview)}</textarea>
+        <div class="row" style="gap:6px;margin-top:6px">
+          <button class="primary memory-save-edit" type="button" title="Save content changes to this memory">Save</button>
+          <button class="ghost memory-cancel-edit" type="button" title="Discard edits and close this form">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function updateMemoriesBulkBar() {
+  const bar = document.getElementById("memories-bulk-bar");
+  if (!bar) return;
+  const count = memoriesState.selected.size;
+  const countEl = document.getElementById("memories-selected-count");
+  const delBtn = document.getElementById("memories-bulk-delete");
+  const clrBtn = document.getElementById("memories-bulk-clear");
+  const selectAll = document.getElementById("memories-select-all");
+  // Show the bar whenever the Memories tab is loaded (we need the "delete all
+  // matching filter" button regardless of selection).
+  bar.hidden = false;
+  if (countEl) countEl.textContent = `${count} selected`;
+  if (delBtn) delBtn.disabled = count === 0;
+  if (clrBtn) clrBtn.disabled = count === 0;
+  if (selectAll) {
+    const visibleIds = Array.from(
+      document.querySelectorAll(".memory-row"),
+    ).map((el) => el.dataset.id);
+    const allPicked =
+      visibleIds.length > 0 &&
+      visibleIds.every((id) => memoriesState.selected.has(id));
+    selectAll.checked = allPicked;
+  }
+}
+
+// Per-row checkbox toggle + Select-all-on-page
+document.addEventListener("change", (e) => {
+  if (e.target.classList?.contains("memory-pick")) {
+    const row = e.target.closest(".memory-row");
+    const id = row?.dataset.id;
+    if (!id) return;
+    if (e.target.checked) memoriesState.selected.add(id);
+    else memoriesState.selected.delete(id);
+    updateMemoriesBulkBar();
+    return;
+  }
+  if (e.target && e.target.id === "memories-select-all") {
+    const rows = document.querySelectorAll(".memory-row");
+    const checking = e.target.checked;
+    rows.forEach((row) => {
+      const id = row.dataset.id;
+      if (!id) return;
+      if (checking) memoriesState.selected.add(id);
+      else memoriesState.selected.delete(id);
+      const cb = row.querySelector(".memory-pick");
+      if (cb) cb.checked = checking;
+    });
+    updateMemoriesBulkBar();
+  }
+});
+
+// Bulk bar buttons
+document.addEventListener("click", async (e) => {
+  if (e.target && e.target.id === "memories-bulk-clear") {
+    memoriesState.selected.clear();
+    document.querySelectorAll(".memory-pick").forEach((cb) => (cb.checked = false));
+    updateMemoriesBulkBar();
+    return;
+  }
+  if (e.target && e.target.id === "memories-bulk-delete") {
+    const ids = Array.from(memoriesState.selected);
+    if (!ids.length) return;
+    if (!confirm(`Delete ${ids.length} selected memor${ids.length === 1 ? "y" : "ies"}? This can't be undone.`)) return;
+    e.target.disabled = true;
+    try {
+      const r = await fetch("/api/memories/bulk-delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+      memoriesState.selected.clear();
+      loadMemoriesTab();
+    } catch (err) {
+      alert("bulk delete failed: " + err.message);
+      e.target.disabled = false;
+    }
+    return;
+  }
+  if (e.target && e.target.id === "memories-delete-all") {
+    const scope = [];
+    if (memoriesState.topic) scope.push(`topic "${memoriesState.topic}"`);
+    if (memoriesState.section) scope.push(`section "${memoriesState.section}"`);
+    const desc = scope.length ? scope.join(" · ") : "EVERY memory in the palace";
+    if (!confirm(`Delete ALL memories matching ${desc}?\n\nThis can't be undone.`)) return;
+    if (!scope.length) {
+      // Extra guard for the nuke case.
+      if (!confirm("Final confirm: wipe the entire palace?")) return;
+    }
+    e.target.disabled = true;
+    try {
+      const r = await fetch("/api/memories/bulk-delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          all_matching: true,
+          topic: memoriesState.topic || undefined,
+          section: memoriesState.section || undefined,
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+      alert(`Deleted ${d.deleted} of ${d.requested}.`);
+      memoriesState.selected.clear();
+      loadMemoriesTab();
+    } catch (err) {
+      alert("delete-all failed: " + err.message);
+    } finally {
+      e.target.disabled = false;
+    }
+    return;
+  }
+});
+
+document.addEventListener("click", async (e) => {
+  const row = e.target.closest?.(".memory-row");
+  if (!row) return;
+  const id = row.dataset.id;
+  if (!id) return;
+
+  if (e.target.classList?.contains("memory-delete")) {
+    if (!confirm("Delete this memory? This can't be undone.")) return;
+    e.target.disabled = true;
+    try {
+      const r = await fetch(`/api/memories/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
+      if (!r.ok) throw new Error(await r.text());
+      row.remove();
+    } catch (err) {
+      alert("delete failed: " + err.message);
+      e.target.disabled = false;
+    }
+  } else if (e.target.classList?.contains("memory-move")) {
+    const newTopic = prompt("Move to topic (lowercase, hyphenated). Leave blank to keep current.");
+    if (newTopic === null) return;
+    const newSection = prompt("Move to section (lowercase, hyphenated). Leave blank to keep current.");
+    if (newSection === null) return;
+    const body = {};
+    if (newTopic && newTopic.trim()) body.topic = newTopic.trim().toLowerCase().replace(/\s+/g, "-");
+    if (newSection && newSection.trim()) body.section = newSection.trim().toLowerCase().replace(/\s+/g, "-");
+    if (!body.topic && !body.section) return;
+    try {
+      const r = await fetch(`/api/drawers/${encodeURIComponent(id)}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      loadMemoriesTab();
+    } catch (err) {
+      alert("move failed: " + err.message);
+    }
+  } else if (e.target.classList?.contains("memory-edit")) {
+    const form = row.querySelector(".memory-edit-form");
+    if (form) form.hidden = !form.hidden;
+  } else if (e.target.classList?.contains("memory-cancel-edit")) {
+    const form = row.querySelector(".memory-edit-form");
+    if (form) form.hidden = true;
+  } else if (e.target.classList?.contains("memory-save-edit")) {
+    const newContent = row.querySelector(".memory-edit-content").value;
+    e.target.disabled = true;
+    try {
+      const r = await fetch(`/api/drawers/${encodeURIComponent(id)}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: newContent }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      loadMemoriesTab();
+    } catch (err) {
+      alert("save failed: " + err.message);
+      e.target.disabled = false;
+    }
+  }
+});
+
+/* ─── Danger zone: wipe entire palace ──────────────────────────────────── */
+
+const nukeState = { phrase: "WIPE MY MEMORY" };
+
+async function openNukeModal() {
+  // Refresh phrase from server (source of truth).
+  try {
+    const r = await fetch("/api/palace/nuke-phrase");
+    const d = await r.json();
+    if (d.phrase) nukeState.phrase = d.phrase;
+  } catch {}
+  const overlay = document.getElementById("nuke-overlay");
+  const input = document.getElementById("nuke-input");
+  const display = document.getElementById("nuke-phrase-display");
+  const confirmBtn = document.getElementById("nuke-confirm");
+  const status = document.getElementById("nuke-status");
+  if (!overlay) return;
+  if (display) display.textContent = nukeState.phrase;
+  if (input) {
+    input.value = "";
+    input.placeholder = nukeState.phrase;
+  }
+  if (status) status.textContent = "";
+  if (confirmBtn) confirmBtn.disabled = true;
+  overlay.hidden = false;
+  setTimeout(() => input?.focus(), 50);
+}
+
+function closeNukeModal() {
+  const overlay = document.getElementById("nuke-overlay");
+  if (overlay) overlay.hidden = true;
+}
+
+document.addEventListener("click", async (e) => {
+  if (e.target && e.target.id === "memories-nuke-btn") {
+    openNukeModal();
+    return;
+  }
+  if (e.target && e.target.id === "nuke-close") { closeNukeModal(); return; }
+  if (e.target && e.target.id === "nuke-cancel") { closeNukeModal(); return; }
+  if (e.target && e.target.id === "nuke-overlay") { closeNukeModal(); return; }
+  if (e.target && e.target.id === "nuke-confirm") {
+    const input = document.getElementById("nuke-input");
+    const status = document.getElementById("nuke-status");
+    const confirmBtn = e.target;
+    if (!input || input.value !== nukeState.phrase) return;
+    confirmBtn.disabled = true;
+    if (status) status.textContent = "wiping…";
+    try {
+      const r = await fetch("/api/palace/nuke", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: input.value }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+      const c = d.counts || {};
+      if (status) {
+        status.innerHTML =
+          `Done. Deleted ${c.drawers || 0} drawers, ${c.kg_triples || 0} facts, ` +
+          `${c.kg_entities || 0} entities, ${c.pending_drawers || 0} pending, ` +
+          `${c.pending_questions || 0} questions.`;
+      }
+      memoriesState.selected.clear();
+      memoriesState.offset = 0;
+      loadMemoriesTab();
+      setTimeout(closeNukeModal, 1800);
+    } catch (err) {
+      if (status) status.textContent = `error: ${err.message}`;
+      confirmBtn.disabled = false;
+    }
+  }
+});
+
+document.addEventListener("input", (e) => {
+  if (e.target && e.target.id === "nuke-input") {
+    const confirmBtn = document.getElementById("nuke-confirm");
+    if (confirmBtn) confirmBtn.disabled = e.target.value !== nukeState.phrase;
+  }
+});
+
+/* ─── Backups (Settings → Conversation → Advanced) ──────────────────────── */
+
+async function renderBackupList() {
+  const host = document.getElementById("backup-list");
+  if (!host) return;
+  try {
+    const r = await fetch("/api/palace/backups");
+    const d = await r.json();
+    const items = d.backups || [];
+    if (!items.length) {
+      host.innerHTML = "<em>no backups yet</em>";
+      return;
+    }
+    host.innerHTML =
+      `<b>Existing snapshots:</b><br>` +
+      items
+        .slice(0, 10)
+        .map(
+          (b) =>
+            `<div>· <code>${escapeHtml(b.name)}</code> <span class="muted">(${formatRelativeTime(b.modified) || "—"})</span></div>`,
+        )
+        .join("") +
+      (items.length > 10 ? `<div class="muted">+${items.length - 10} more</div>` : "");
+  } catch {}
+}
+
+document.addEventListener("click", async (e) => {
+  if (e.target && e.target.id === "backup-now-btn") {
+    const status = document.getElementById("backup-status");
+    const btn = e.target;
+    btn.disabled = true;
+    if (status) status.textContent = "backing up…";
+    try {
+      const r = await fetch("/api/palace/backup", { method: "POST" });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+      const parts = Object.keys(d.created || {});
+      if (status) {
+        status.textContent = parts.length
+          ? `✓ ${d.timestamp} (${parts.join(", ")})`
+          : "nothing to back up";
+        status.className = "ok";
+      }
+      renderBackupList();
+      setTimeout(() => {
+        if (status) {
+          status.className = "muted";
+        }
+      }, 2500);
+    } catch (err) {
+      if (status) {
+        status.textContent = `error: ${err.message}`;
+        status.className = "err";
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  }
+});
+
+// Render list on open
+(function wireBackupPaneHook() {
+  const showPane = window.showSettingsPane;
+  if (typeof showPane !== "function") return;
+  // Settings pane rendering is via a `data-pane` click. Hook the Advanced
+  // show by polling the pane visibility once per settings open.
+  const openSettings = document.getElementById("open-settings");
+  if (openSettings && !openSettings.dataset.backupHooked) {
+    openSettings.dataset.backupHooked = "1";
+    openSettings.addEventListener("click", () => {
+      setTimeout(renderBackupList, 200);
+    });
+  }
+})();
+
+/* ─── First-run onboarding hint ─────────────────────────────────────────── */
+
+// Enhance the empty state for brand-new users (no chats + no memories).
+async function maybeShowFirstRunHint() {
+  try {
+    const [topics, sessions] = await Promise.all([
+      fetch("/api/memories/topics").then((r) => r.json()),
+      Promise.resolve(state.sessions || []),
+    ]);
+    const noMemories = (topics?.total ?? 0) === 0;
+    const noChatYet =
+      !sessions.length || sessions.every((s) => !s.messages || s.messages.length === 0);
+    const host = els.emptyState;
+    if (!host || host.hidden) return;
+    if (!noMemories || !noChatYet) return;
+    if (host.querySelector(".first-run-card")) return; // already present
+    const extra = document.createElement("div");
+    extra.className = "first-run-card";
+    extra.innerHTML = `
+      <div class="first-run-title">First time here?</div>
+      <p class="first-run-body">
+        Try saying something specific — the assistant files the important bits
+        into topics automatically, so you can find them again later.
+      </p>
+      <ul class="first-run-examples">
+        <li>"I'm a <i>[your role]</i> working on <i>[your project]</i>."</li>
+        <li>"Remember that I prefer <i>[habit/preference]</i>."</li>
+        <li>"Kai is my co-founder. He handles <i>[area]</i>."</li>
+      </ul>
+      <p class="first-run-body muted">
+        The <b>Memory</b> sidebar button shows everything it's remembered.
+        Auto-file memories is on by default (Settings → Conversation to adjust).
+      </p>
+    `;
+    host.appendChild(extra);
+  } catch {}
+}
+
+// Observer approach: whenever the empty state's innerHTML changes,
+// re-check if we should append the first-run card. Decoupled from
+// renderEmptyState's function-declaration scope.
+if (typeof MutationObserver !== "undefined") {
+  const host = document.getElementById("empty-state");
+  if (host) {
+    const obs = new MutationObserver(() => maybeShowFirstRunHint());
+    obs.observe(host, { childList: true, subtree: false });
+  }
+}

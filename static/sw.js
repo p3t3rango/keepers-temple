@@ -2,7 +2,7 @@
 // and cache static assets for fast offline-startup. We DON'T cache /api/*
 // (always live) or "/" (re-fetch each load to pick up HTML changes).
 
-const CACHE = "ollama-mempalace-v1";
+const CACHE = "keepers-temple-v20-rename-backup-firstrun";
 const STATIC_ASSETS = [
   "/static/app.css",
   "/static/app.js",
@@ -41,19 +41,32 @@ self.addEventListener("fetch", (event) => {
   ) {
     return;
   }
-  // Cache-first for static assets
   if (url.pathname.startsWith("/static/")) {
-    event.respondWith(
-      caches.match(event.request).then(
-        (hit) =>
-          hit ||
-          fetch(event.request).then((res) => {
-            // Stash a copy for next time
+    // Network-first for JS/CSS so dev edits always win. Fall back to cache
+    // only when offline. Icons/manifest stay cache-first (they change rarely).
+    const isScript = /\.(js|css)(\?.*)?$/.test(url.pathname);
+    if (isScript) {
+      event.respondWith(
+        fetch(event.request)
+          .then((res) => {
             const clone = res.clone();
             caches.open(CACHE).then((cache) => cache.put(event.request, clone));
             return res;
-          }),
-      ),
-    );
+          })
+          .catch(() => caches.match(event.request)),
+      );
+    } else {
+      event.respondWith(
+        caches.match(event.request).then(
+          (hit) =>
+            hit ||
+            fetch(event.request).then((res) => {
+              const clone = res.clone();
+              caches.open(CACHE).then((cache) => cache.put(event.request, clone));
+              return res;
+            }),
+        ),
+      );
+    }
   }
 });
