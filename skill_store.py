@@ -297,3 +297,88 @@ def list_skills(include_archived: bool = False) -> list[dict]:
                 "state": "archived",
             })
     return out
+
+
+def patch_skill(
+    name: str,
+    old_string: str,
+    new_string: str,
+    file_path: Optional[str] = None,
+    replace_all: bool = False,
+) -> dict:
+    slug = slugify(name)
+    d = _skill_dir(slug)
+    if d is None:
+        raise SkillError(f"skill '{slug}' not found")
+    target = d / (file_path or "SKILL.md")
+    if not target.exists() or d not in target.parents and target != d / "SKILL.md":
+        raise SkillError(f"target file not found: {file_path or 'SKILL.md'}")
+    original = target.read_text()
+    if old_string not in original:
+        raise SkillError("old_string not found in skill file")
+    updated = (
+        original.replace(old_string, new_string)
+        if replace_all
+        else original.replace(old_string, new_string, 1)
+    )
+    if target.name == "SKILL.md":
+        try:
+            parse_frontmatter(updated)  # rollback-safe validation
+        except SkillError as e:
+            raise SkillError(f"patch would corrupt skill: {e}")
+        reason = security_scan(updated)
+        if reason:
+            raise SkillError(reason)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(updated)
+    tmp.replace(target)
+    rec = _load_usage().get(slug, {})
+    _touch_usage(
+        slug,
+        patch_count=int(rec.get("patch_count", 0)) + 1,
+        last_patched_at=_now(),
+    )
+    if target.name == "SKILL.md":
+        meta, _ = parse_frontmatter(updated)
+        index_skill(slug, meta.get("description", ""), str(target))
+    return {"name": slug, "patched": file_path or "SKILL.md"}
+
+
+def archive_skill(name: str) -> dict:
+    slug = slugify(name)
+    d = _skill_dir(slug)
+    if d is None:
+        raise SkillError(f"skill '{slug}' not found")
+    cat = d.parent.name
+    dest = archive_root() / cat / slug
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.move(str(d), str(dest))
+    _touch_usage(slug, archived=True)
+    return {"name": slug, "state": "archived"}
+
+
+def restore_skill(name: str) -> dict:
+    slug = slugify(name)
+    src = None
+    for md in archive_root().glob("*/*/SKILL.md"):
+        if md.parent.name == slug:
+            src = md.parent
+            break
+    if src is None:
+        raise SkillError(f"archived skill '{slug}' not found")
+    cat = src.parent.name
+    dest = skills_root() / cat / slug
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dest))
+    _touch_usage(slug, archived=False)
+    return {"name": slug, "state": "active"}
+
+
+def set_pinned(name: str, pinned: bool) -> dict:
+    slug = slugify(name)
+    if _skill_dir(slug) is None:
+        raise SkillError(f"skill '{slug}' not found")
+    _touch_usage(slug, pinned=bool(pinned))
+    return {"name": slug, "pinned": bool(pinned)}

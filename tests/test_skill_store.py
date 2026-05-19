@@ -17,6 +17,17 @@ if _REPO_ROOT not in sys.path:
 import skill_store as ss  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _clean_skills():
+    """Isolate the skill-store filesystem between tests (mirrors the
+    _clean_pending pattern in tests/test_app_review_endpoints.py)."""
+    import shutil
+    shutil.rmtree(
+        os.path.join(_TMP_HOME, ".mempalace", "skills"), ignore_errors=True
+    )
+    yield
+
+
 def test_slugify_normalizes():
     assert ss.slugify("Deploy Keepers Temple!") == "deploy-keepers-temple"
     assert ss.slugify("  multiple   spaces ") == "multiple-spaces"
@@ -104,3 +115,29 @@ def test_create_rejects_duplicate_and_unsafe():
 def test_create_marks_agent_created_flag():
     ss.create_skill(name="ag", description="d", body="b\n", agent_created=True)
     assert ss._load_usage()["ag"]["agent_created"] is True
+
+
+def test_patch_replaces_and_bumps_count():
+    ss.create_skill(name="p", description="d", body="step one\nstep two\n")
+    ss.patch_skill("p", old_string="step two", new_string="step 2 revised")
+    assert "step 2 revised" in ss.get_skill("p")["body"]
+    assert ss._load_usage()["p"]["patch_count"] == 1
+    with pytest.raises(ss.SkillError):
+        ss.patch_skill("p", old_string="not present", new_string="x")
+
+
+def test_patch_rejects_frontmatter_break():
+    ss.create_skill(name="fm", description="keepme", body="body\n")
+    with pytest.raises(ss.SkillError):
+        ss.patch_skill("fm", old_string="keepme", new_string="")  # empties description
+
+
+def test_archive_restore_pin_cycle():
+    ss.create_skill(name="cyc", description="d", body="b\n", category="ops")
+    ss.archive_skill("cyc")
+    assert ss.get_skill("cyc")["state"] == "archived"
+    assert [s["name"] for s in ss.list_skills()] == []
+    ss.restore_skill("cyc")
+    assert ss.get_skill("cyc")["state"] == "active"
+    ss.set_pinned("cyc", True)
+    assert ss.get_skill("cyc")["pinned"] is True
