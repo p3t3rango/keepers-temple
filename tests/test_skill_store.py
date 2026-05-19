@@ -141,3 +141,30 @@ def test_archive_restore_pin_cycle():
     assert ss.get_skill("cyc")["state"] == "active"
     ss.set_pinned("cyc", True)
     assert ss.get_skill("cyc")["pinned"] is True
+
+
+def test_description_with_trailing_quote_roundtrips():
+    ss.create_skill(name="q", description='say "hi"', body="b\n")
+    assert ss.get_skill("q")["description"] == 'say "hi"'
+
+
+def test_create_blocked_by_archived_in_other_category():
+    ss.create_skill(name="dupe", description="d", body="b\n", category="c1")
+    ss.archive_skill("dupe")
+    with pytest.raises(ss.SkillError):
+        ss.create_skill(name="dupe", description="d2", body="b2\n", category="c2")
+
+
+def test_patch_rejects_path_traversal():
+    ss.create_skill(name="aa", description="d", body="x\n", category="c1")
+    ss.create_skill(name="bb", description="d", body="secret\n", category="c2")
+    with pytest.raises(ss.SkillError):
+        ss.patch_skill("aa", old_string="secret", new_string="pwned",
+                        file_path="../../c2/bb/SKILL.md")
+
+
+def test_create_and_patch_call_index(_no_palace):
+    ss.create_skill(name="ix", description="d", body="b\n")
+    assert len(_no_palace) == 1
+    ss.patch_skill("ix", old_string="b", new_string="c")
+    assert len(_no_palace) == 2

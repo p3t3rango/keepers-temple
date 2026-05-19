@@ -26,6 +26,14 @@ def slugify(text: str) -> str:
     return s.strip("-")
 
 
+def _unquote(s: str) -> str:
+    if len(s) >= 2 and (
+        (s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")
+    ):
+        return s[1:-1]
+    return s
+
+
 def _yaml_scalar(v: str):
     v = v.strip()
     if v.startswith("[") and v.endswith("]"):
@@ -37,12 +45,12 @@ def _yaml_scalar(v: str):
             pass
         inner = v[1:-1].strip()
         return (
-            [p.strip().strip("\"'") for p in inner.split(",") if p.strip()]
+            [_unquote(p.strip()) for p in inner.split(",") if p.strip()]
             if inner else []
         )
     if v.lower() in ("true", "false"):
         return v.lower() == "true"
-    return v.strip("\"'")
+    return _unquote(v)
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -58,13 +66,11 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
         raise SkillError("missing closing '---' frontmatter fence")
     raw_meta, body = parts[1], parts[2]
     meta: dict = {}
-    current = meta
     for line in raw_meta.splitlines():
         if not line.strip() or line.strip().startswith("#"):
             continue
         if re.match(r"^\S.*:\s*$", line) and line.strip().rstrip(":") == "metadata":
             meta["metadata"] = {}
-            current = meta["metadata"]
             continue
         m = re.match(r"^(\s*)([\w.-]+):\s*(.*)$", line)
         if not m:
@@ -190,6 +196,13 @@ def _skill_dir(name: str) -> Optional[Path]:
     return None
 
 
+def _archived_skill_dir(slug: str) -> Optional[Path]:
+    for md in archive_root().glob("*/*/SKILL.md"):
+        if md.parent.name == slug:
+            return md.parent
+    return None
+
+
 def _all_skill_md(root: Path):
     return list(root.glob("*/*/SKILL.md"))
 
@@ -209,7 +222,7 @@ def create_skill(
     cat = slugify(category) or "general"
     if not slug:
         raise SkillError("skill name is empty after normalization")
-    if _skill_dir(slug) is not None or (archive_root() / cat / slug).exists():
+    if _skill_dir(slug) is not None or _archived_skill_dir(slug) is not None:
         raise SkillError(f"skill '{slug}' already exists")
     reason = security_scan(body) or security_scan(description)
     if reason:
@@ -266,12 +279,13 @@ def get_skill(name: str) -> dict:
 
 def list_skills(include_archived: bool = False) -> list[dict]:
     out = []
+    usage = _load_usage()
     for md in sorted(_all_skill_md(skills_root())):
         try:
             meta, _ = parse_frontmatter(md.read_text())
         except SkillError:
             continue
-        rec = _load_usage().get(md.parent.name, {})
+        rec = usage.get(md.parent.name, {})
         out.append({
             "name": meta["name"],
             "description": meta.get("description", ""),
@@ -291,9 +305,7 @@ def list_skills(include_archived: bool = False) -> list[dict]:
                 "description": meta.get("description", ""),
                 "category": md.parent.parent.name,
                 "pinned": False,
-                "agent_created": bool(
-                    _load_usage().get(md.parent.name, {}).get("agent_created")
-                ),
+                "agent_created": bool(usage.get(md.parent.name, {}).get("agent_created")),
                 "state": "archived",
             })
     return out
@@ -311,7 +323,11 @@ def patch_skill(
     if d is None:
         raise SkillError(f"skill '{slug}' not found")
     target = d / (file_path or "SKILL.md")
-    if not target.exists() or d not in target.parents and target != d / "SKILL.md":
+    resolved = target.resolve()
+    skill_root = d.resolve()
+    if not target.exists() or (
+        skill_root not in resolved.parents and resolved != skill_root / "SKILL.md"
+    ):
         raise SkillError(f"target file not found: {file_path or 'SKILL.md'}")
     original = target.read_text()
     if old_string not in original:
@@ -368,6 +384,8 @@ def restore_skill(name: str) -> dict:
             break
     if src is None:
         raise SkillError(f"archived skill '{slug}' not found")
+    if _skill_dir(slug) is not None:
+        raise SkillError(f"an active skill '{slug}' already exists")
     cat = src.parent.name
     dest = skills_root() / cat / slug
     dest.parent.mkdir(parents=True, exist_ok=True)
