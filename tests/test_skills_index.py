@@ -92,3 +92,33 @@ def test_chatrequest_defaults():
     r = _req()
     assert r.use_skills is True
     assert r.skill_limit == 15
+
+
+def test_conversation_search_filters_to_chat_transcripts(monkeypatch):
+    fake = {
+        "results": [
+            {"wing": "personal", "room": "general", "similarity": 0.9,
+             "text": "a chat", "source_file": "chat://m/s/2026-05-19T00:00:00"},
+            {"wing": "personal", "room": "hall_facts", "similarity": 0.8,
+             "text": "a fact", "source_file": "extract://x"},
+            {"wing": "kt-skills", "room": "index", "similarity": 0.7,
+             "text": "skill: d", "source_file": "skill:///p/SKILL.md"},
+        ]
+    }
+    monkeypatch.setattr(app_module, "search_memories", lambda *a, **k: fake)
+    res = app_module._exec_tool(
+        "conversation_search", {"query": "anything", "n": 5}, "personal", None
+    )
+    assert res["count"] == 1
+    assert res["hits"][0]["text"] == "a chat"
+    assert all(h["text"] == "a chat" for h in res["hits"])
+
+    miss = app_module._exec_tool(
+        "conversation_search", {"query": ""}, "personal", None
+    )
+    assert miss.get("error")
+
+
+def test_conversation_search_in_tools_list():
+    names = {t["function"]["name"] for t in app_module.TOOLS}
+    assert "conversation_search" in names

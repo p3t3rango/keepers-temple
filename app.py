@@ -1808,6 +1808,29 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "conversation_search",
+            "description": (
+                "Search PRIOR CHAT TRANSCRIPTS (past conversations with this "
+                "user) for relevant context. Distinct from memory_search "
+                "(saved facts + skills) — use this when you need what was "
+                "actually said in earlier sessions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "n": {"type": "integer",
+                          "description": "Max results 1-10 (default 5)."},
+                    "wing": {"type": "string",
+                             "description": "Optional wing to scope to."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 TOOL_PROTOCOL = (
@@ -1965,6 +1988,34 @@ def _exec_tool(
                 return {"error": f"unknown skill_manage action: {action}"}
             except skill_store.SkillError as e:
                 return {"error": str(e)}
+        if name == "conversation_search":
+            q = str(args.get("query") or "").strip()
+            if not q:
+                return {"error": "query is required"}
+            wing = args.get("wing") or None
+            n = max(1, min(int(args.get("n", 5)), 10))
+            result = search_memories(
+                q, palace_path=PALACE_PATH, wing=wing, n_results=n * 3
+            )
+            hits = result.get("results", []) or []
+            convo = [
+                h for h in hits
+                if str(h.get("source_file") or "").startswith("chat://")
+            ][:n]
+            return {
+                "count": len(convo),
+                "hits": [
+                    {
+                        "wing": h.get("wing"),
+                        "room": h.get("room"),
+                        "similarity": h.get("similarity"),
+                        "text": (h.get("text") or "")[:600],
+                        "when": (str(h.get("source_file") or "")
+                                 .split("/")[-1] or None),
+                    }
+                    for h in convo
+                ],
+            }
         return {"error": f"unknown tool: {name}"}
     except Exception as e:
         return {"error": str(e)}
