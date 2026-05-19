@@ -21,6 +21,14 @@ class SkillError(Exception):
     """Raised for any invalid skill input or store operation."""
 
 
+class SkillNotFoundError(SkillError):
+    """Raised when a referenced skill (active or archived) does not exist."""
+
+
+class SkillConflictError(SkillError):
+    """Raised when an operation conflicts with existing state (duplicate/active)."""
+
+
 def slugify(text: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", str(text).strip().lower())
     return s.strip("-")
@@ -223,7 +231,7 @@ def create_skill(
     if not slug:
         raise SkillError("skill name is empty after normalization")
     if _skill_dir(slug) is not None or _archived_skill_dir(slug) is not None:
-        raise SkillError(f"skill '{slug}' already exists")
+        raise SkillConflictError(f"skill '{slug}' already exists")
     reason = security_scan(body) or security_scan(description)
     if reason:
         raise SkillError(reason)
@@ -259,7 +267,7 @@ def get_skill(name: str) -> dict:
                 archived = True
                 break
     if d is None:
-        raise SkillError(f"skill '{slug}' not found")
+        raise SkillNotFoundError(f"skill '{slug}' not found")
     meta, body = parse_frontmatter((d / "SKILL.md").read_text())
     rec = _load_usage().get(slug, {})
     return {
@@ -286,7 +294,7 @@ def read_skill_file(name: str, file_path: str) -> str:
     slug = slugify(name)
     d = _skill_dir(slug) or _archived_skill_dir(slug)
     if d is None:
-        raise SkillError(f"skill '{slug}' not found")
+        raise SkillNotFoundError(f"skill '{slug}' not found")
     if not file_path:
         raise SkillError("file_path is required")
     target = d / file_path
@@ -343,7 +351,7 @@ def patch_skill(
     slug = slugify(name)
     d = _skill_dir(slug)
     if d is None:
-        raise SkillError(f"skill '{slug}' not found")
+        raise SkillNotFoundError(f"skill '{slug}' not found")
     target = d / (file_path or "SKILL.md")
     resolved = target.resolve()
     skill_root = d.resolve()
@@ -386,7 +394,7 @@ def archive_skill(name: str) -> dict:
     slug = slugify(name)
     d = _skill_dir(slug)
     if d is None:
-        raise SkillError(f"skill '{slug}' not found")
+        raise SkillNotFoundError(f"skill '{slug}' not found")
     cat = d.parent.name
     dest = archive_root() / cat / slug
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -405,9 +413,9 @@ def restore_skill(name: str) -> dict:
             src = md.parent
             break
     if src is None:
-        raise SkillError(f"archived skill '{slug}' not found")
+        raise SkillNotFoundError(f"archived skill '{slug}' not found")
     if _skill_dir(slug) is not None:
-        raise SkillError(f"an active skill '{slug}' already exists")
+        raise SkillConflictError(f"an active skill '{slug}' already exists")
     cat = src.parent.name
     dest = skills_root() / cat / slug
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -419,6 +427,6 @@ def restore_skill(name: str) -> dict:
 def set_pinned(name: str, pinned: bool) -> dict:
     slug = slugify(name)
     if _skill_dir(slug) is None:
-        raise SkillError(f"skill '{slug}' not found")
+        raise SkillNotFoundError(f"skill '{slug}' not found")
     _touch_usage(slug, pinned=bool(pinned))
     return {"name": slug, "pinned": bool(pinned)}

@@ -19,12 +19,10 @@ import skill_store as ss  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _clean_skills():
-    """Isolate the skill-store filesystem between tests (mirrors the
-    _clean_pending pattern in tests/test_app_review_endpoints.py)."""
+    """Isolate the skill-store filesystem between tests (resolve the active
+    path at runtime, mirroring the _clean_pending pattern)."""
     import shutil
-    shutil.rmtree(
-        os.path.join(_TMP_HOME, ".mempalace", "skills"), ignore_errors=True
-    )
+    shutil.rmtree(ss.skills_root(), ignore_errors=True)
     yield
 
 
@@ -64,7 +62,7 @@ def test_usage_state_roundtrip():
     ss._save_usage({"alpha": {"pinned": True}})
     assert ss._load_usage()["alpha"]["pinned"] is True
     # skills_root is under the redirected HOME
-    assert str(ss.skills_root()).startswith(_TMP_HOME)
+    assert str(ss.skills_root()).startswith(os.path.expanduser("~"))
     assert ss.skills_root().name == "skills"
 
 

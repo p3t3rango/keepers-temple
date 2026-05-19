@@ -129,16 +129,16 @@ class IdentityBody(BaseModel):
 
 
 class SkillCreateBody(BaseModel):
-    name: str
-    description: str
-    body: str
-    category: str = "general"
+    name: str = Field(..., min_length=1, max_length=200)
+    description: str = Field(..., min_length=1, max_length=2000)
+    body: str = Field(..., min_length=1, max_length=512_000)
+    category: str = Field("general", max_length=100)
 
 
 class SkillPatchBody(BaseModel):
-    old_string: str
-    new_string: str
-    file_path: Optional[str] = None
+    old_string: str = Field(..., min_length=1, max_length=512_000)
+    new_string: str = Field(..., max_length=512_000)
+    file_path: Optional[str] = Field(None, max_length=500)
     replace_all: bool = False
 
 
@@ -2545,6 +2545,8 @@ def api_skill_create(body: SkillCreateBody):
         return skill_store.create_skill(
             name=body.name, description=body.description,
             body=body.body, category=body.category)
+    except skill_store.SkillConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except skill_store.SkillError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -2556,6 +2558,8 @@ def api_skill_patch(name: str, body: SkillPatchBody):
             name=name, old_string=body.old_string,
             new_string=body.new_string, file_path=body.file_path,
             replace_all=body.replace_all)
+    except skill_store.SkillNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except skill_store.SkillError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -2572,6 +2576,8 @@ def api_skill_archive(name: str):
 def api_skill_restore(name: str):
     try:
         return skill_store.restore_skill(name)
+    except skill_store.SkillConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except skill_store.SkillError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
