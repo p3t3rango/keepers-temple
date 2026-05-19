@@ -319,6 +319,16 @@ blocker. It independently arrived at "files are truth, index derived" and
   output with a deterministic parser + regex fallback) — this matters *more* for
   weak local models. Do **not** port gbrain's synthesize/patterns prompts (tuned
   for Claude-class context/structured-output reliability).
+- **Carried-forward from Plan 1 execution (final review):**
+  - *Plan 2 prereq (FU-2):* `archive_skill`/`restore_skill` do not update the
+    MemPalace `_skills/index` drawer. Plan 2's L1.5 injection must filter archived
+    skills by the authoritative `.usage.json` `archived` flag (or add a
+    `deindex_skill`). Invisible until L1.5 has a consumer.
+  - *Plan 4 (FU-1):* `SkillCreateBody` (`POST /api/skills`) exposes only
+    `name/description/body/category`; the GUI edit flow will need
+    `triggers/tools/mutating` added (or a separate full-edit body). The
+    `skill_manage` tool already passes all three; store/frontmatter roundtrip
+    preserves them.
 - **Plan 4 (note):** one shared `run_curator()` entry point for both the manual
   "run now" action and the scheduler; an explicit ordered phase list with a
   documented rationale per phase; a PID+mtime+TTL lockfile under `~/.mempalace/`
