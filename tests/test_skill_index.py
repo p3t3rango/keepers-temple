@@ -62,3 +62,22 @@ def test_index_skill_silent_on_success(monkeypatch, caplog):
     assert captured["room"] == ss.SKILL_INDEX_ROOM
     assert captured["content"] == "demo: desc"
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_deindex_skill_removes_real_drawer():
+    import skill_store as s
+    from mempalace.mcp_server import tool_list_drawers
+
+    s.create_skill(name="rs-deindex", description="real deindex check",
+                   body="## Contract\nx\n", category="smoketest")
+    before = tool_list_drawers(wing=s.SKILL_INDEX_WING, room=s.SKILL_INDEX_ROOM)
+    assert any(
+        (d.get("content_preview") or "").startswith("rs-deindex: ")
+        for d in before.get("drawers", [])
+    )
+    s.deindex_skill("rs-deindex")
+    after = tool_list_drawers(wing=s.SKILL_INDEX_WING, room=s.SKILL_INDEX_ROOM)
+    assert not any(
+        (d.get("content_preview") or "").startswith("rs-deindex: ")
+        for d in after.get("drawers", [])
+    )

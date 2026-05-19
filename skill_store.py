@@ -211,6 +211,34 @@ def index_skill(name: str, description: str, path: str) -> None:
         logger.warning("skill index write errored for %r", name, exc_info=True)
 
 
+def deindex_skill(name: str) -> None:
+    """Best-effort: remove the skill's kt-skills/index drawer(s).
+
+    Never raises (mirrors index_skill); WARNING-logs on failure. Matches by
+    content prefix '<slug>: ' since the index drawer content is
+    f"{slug}: {description}" (see index_skill).
+    """
+    slug = slugify(name)
+    try:
+        from mempalace.mcp_server import tool_list_drawers, tool_delete_drawer
+
+        listing = tool_list_drawers(
+            wing=SKILL_INDEX_WING, room=SKILL_INDEX_ROOM
+        )
+        drawers = listing.get("drawers", []) if isinstance(listing, dict) else []
+        removed = 0
+        for d in drawers:
+            preview = (d.get("content_preview") or "")
+            if preview.startswith(f"{slug}: "):
+                res = tool_delete_drawer(d.get("drawer_id"))
+                if isinstance(res, dict) and res.get("success"):
+                    removed += 1
+        if removed == 0:
+            logger.warning("deindex_skill: no kt-skills drawer found for %r", slug)
+    except Exception:
+        logger.warning("deindex_skill errored for %r", slug, exc_info=True)
+
+
 def _skill_dir(name: str) -> Optional[Path]:
     for md in skills_root().glob("*/*/SKILL.md"):
         if md.parent.name == name:
@@ -416,6 +444,7 @@ def archive_skill(name: str) -> dict:
         shutil.rmtree(dest)
     shutil.move(str(d), str(dest))
     _touch_usage(slug, archived=True)
+    deindex_skill(slug)
     return {"name": slug, "state": "archived"}
 
 
@@ -435,6 +464,11 @@ def restore_skill(name: str) -> dict:
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dest))
     _touch_usage(slug, archived=False)
+    try:
+        meta, _ = parse_frontmatter((dest / "SKILL.md").read_text())
+        index_skill(slug, meta.get("description", ""), str(dest / "SKILL.md"))
+    except Exception:
+        logger.warning("restore_skill: re-index failed for %r", slug, exc_info=True)
     return {"name": slug, "state": "active"}
 
 
