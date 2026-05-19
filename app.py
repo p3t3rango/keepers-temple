@@ -1992,6 +1992,8 @@ def _exec_tool(
             q = str(args.get("query") or "").strip()
             if not q:
                 return {"error": "query is required"}
+            # Default to all wings (None) — chat transcripts can span any wing
+            # the user has used, unlike memory_search which scopes to current.
             wing = args.get("wing") or None
             n = max(1, min(int(args.get("n", 5)), 10))
             result = search_memories(

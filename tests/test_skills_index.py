@@ -122,3 +122,19 @@ def test_conversation_search_filters_to_chat_transcripts(monkeypatch):
 def test_conversation_search_in_tools_list():
     names = {t["function"]["name"] for t in app_module.TOOLS}
     assert "conversation_search" in names
+
+
+def test_conversation_search_clamps_n_to_ten(monkeypatch):
+    # 15 chat-source hits returned; tool must cap at 10 even if caller asks 50.
+    fake_hits = [
+        {"wing": "personal", "room": "general", "similarity": 0.5,
+         "text": f"chat #{i}", "source_file": f"chat://m/s/2026-05-19T00:00:{i:02d}"}
+        for i in range(15)
+    ]
+    monkeypatch.setattr(
+        app_module, "search_memories", lambda *a, **k: {"results": fake_hits}
+    )
+    res = app_module._exec_tool(
+        "conversation_search", {"query": "x", "n": 50}, "personal", None
+    )
+    assert res["count"] == 10
