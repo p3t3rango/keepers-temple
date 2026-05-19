@@ -108,9 +108,17 @@ weak local models follow far more reliably than free-form prose.
 - **File = source of truth.** Human-readable, user-editable in the GUI
   (the whole point for non-terminal users).
 - **Palace index.** On every create/patch, the skill's `name + description`
-  (not the full body) is upserted as a MemPalace drawer with
-  `memory_type="skill"` and `metadata.skill_path` pointing at the file, so skill
-  retrieval is unified with existing semantic search. Body stays on disk.
+  (not the full body) is best-effort indexed into MemPalace so skill retrieval
+  is unified with existing semantic search; body stays on disk.
+  *Implementation reality (Plan 1 debugging):* MemPalace's `tool_add_drawer` has
+  **no `memory_type`/`metadata` parameter**, so the index is a content-only
+  drawer (`"<name>: <description>"`, `source_file="skill://<path>"`) written to
+  wing **`kt-skills`** room **`index`**. The wing name MUST pass
+  `sanitize_name` (no leading/trailing underscore — the original `_skills` was
+  silently rejected). The write is non-fatal but **logged at WARNING on
+  failure** (never silent). Plan 2 follow-up: exclude `kt-skills` from the
+  `_existing_topic_names()` topic hint so the model doesn't treat it as a
+  user-facing memory bucket.
 - Supporting files (`references/`, `templates/`, `scripts/`) are supported by
   layout but not required for v1.
 - Validation on write: opening/closing `---`, parseable YAML frontmatter with
@@ -321,9 +329,18 @@ blocker. It independently arrived at "files are truth, index derived" and
   for Claude-class context/structured-output reliability).
 - **Carried-forward from Plan 1 execution (final review):**
   - *Plan 2 prereq (FU-2):* `archive_skill`/`restore_skill` do not update the
-    MemPalace `_skills/index` drawer. Plan 2's L1.5 injection must filter archived
-    skills by the authoritative `.usage.json` `archived` flag (or add a
-    `deindex_skill`). Invisible until L1.5 has a consumer.
+    MemPalace `kt-skills/index` drawer. Plan 2's L1.5 injection must filter
+    archived skills by the authoritative `.usage.json` `archived` flag (or add a
+    `deindex_skill`). Invisible until L1.5 has a consumer. Also exclude the
+    `kt-skills` wing from `_existing_topic_names()` so it isn't offered to the
+    model as a reusable memory topic.
+  - *Plan 1 debugging fix (resolved):* `index_skill` originally targeted the
+    invalid wing `_skills` and ignored `tool_add_drawer`'s `{'success': False}`
+    return → the palace index was a silent no-op (unit tests stubbed the seam).
+    Fixed: valid wing `kt-skills`, return value honored, WARNING-logged,
+    `tests/test_skill_index.py` added (real `sanitize_name`), verified
+    end-to-end against a real palace. The unit suite's mocking of `index_skill`
+    is why this only surfaced in manual smoke testing.
   - *Plan 4 (FU-1):* `SkillCreateBody` (`POST /api/skills`) exposes only
     `name/description/body/category`; the GUI edit flow will need
     `triggers/tools/mutating` added (or a separate full-edit body). The

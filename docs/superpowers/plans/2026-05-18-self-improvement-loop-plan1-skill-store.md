@@ -1220,6 +1220,19 @@ APPROVED. (Task 8's regression step is satisfied by the full local suite + clean
 `app` import; `tests/test_app_review_endpoints.py` legitimately lives on a
 different branch and is not expected here.)
 
+**Manual-smoke bugfix (post-merge-review, commit `8659b85`):** a real-palace
+smoke test (not the mocked suite) revealed `index_skill` was a **silent no-op** —
+it wrote to wing `_skills`, which `sanitize_name` rejects (leading underscore),
+and `tool_add_drawer` *returns* `{'success': False}` rather than raising, so the
+`except Exception: pass` never fired. Root-caused via systematic-debugging.
+Fixed: valid wing `kt-skills` + room `index` (constants), return value honored
+and WARNING-logged (still best-effort, never raises), content-only drawer
+(`tool_add_drawer` has no metadata param). Added `tests/test_skill_index.py`
+(3 tests, real `sanitize_name`, not mocked) pinning both defects; verified
+end-to-end against a real palace (drawer lands in `kt-skills/index`). 31 tests
+pass; review APPROVED. Lesson: the unit suite stubs `index_skill`, so the
+file↔palace seam needs an integration check, not just mocks.
+
 **Anchor note:** on this branch `app.py` is the clean-`main` variant — the plan's
 line numbers (from the review-gate working tree) do not apply; locate insertion
 points by code anchor (`import mcp_client`, the `TOOLS` list close, the
