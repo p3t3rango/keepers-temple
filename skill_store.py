@@ -9,12 +9,15 @@ HOME after import.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class SkillError(Exception):
@@ -177,24 +180,35 @@ def render_skill(meta: dict, body: str) -> str:
     return "\n".join(lines) + "\n" + body.lstrip("\n")
 
 
+# MemPalace wing/room for the best-effort skill index. The wing name MUST pass
+# mempalace.config.sanitize_name (no leading/trailing underscore). See Plan 1
+# debugging note: '_skills' was rejected by _SAFE_NAME_RE.
+SKILL_INDEX_WING = "kt-skills"
+SKILL_INDEX_ROOM = "index"
+
+
 def index_skill(name: str, description: str, path: str) -> None:
     """Best-effort: upsert name+description into MemPalace for unified search.
 
-    Imported lazily and wrapped so the store never hard-depends on the palace
-    being initialized. Real implementation lands here; unit tests stub it.
+    Never raises (file remains the source of truth) but is no longer SILENT:
+    a failed/erroring index write is logged at WARNING. tool_add_drawer has no
+    metadata param, so the index drawer is content-only ("name: description").
     """
     try:
         from mempalace.mcp_server import tool_add_drawer
 
-        tool_add_drawer(
-            wing="_skills",
-            room="index",
+        result = tool_add_drawer(
+            wing=SKILL_INDEX_WING,
+            room=SKILL_INDEX_ROOM,
             content=f"{name}: {description}",
             source_file=f"skill://{path}",
             added_by="skill_store-index",
         )
+        if not (isinstance(result, dict) and result.get("success")):
+            detail = result.get("error") if isinstance(result, dict) else result
+            logger.warning("skill index write failed for %r: %s", name, detail)
     except Exception:
-        pass
+        logger.warning("skill index write errored for %r", name, exc_info=True)
 
 
 def _skill_dir(name: str) -> Optional[Path]:
