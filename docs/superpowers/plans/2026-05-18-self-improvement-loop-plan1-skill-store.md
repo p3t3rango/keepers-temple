@@ -1171,4 +1171,18 @@ archive-not-delete, `.usage.json`) and §12 (`derived` API flag) → Tasks 1,3,4
 
 **Type consistency:** `skill_store` public surface is consistent across tasks — `SkillError`, `slugify`, `parse_frontmatter`, `render_skill`, `security_scan`, `skills_root`, `archive_root`, `_load_usage`/`_save_usage`/`_touch_usage`, `index_skill(name, description, path)`, `_skill_dir`, `create_skill(name, description, body, category, metadata, agent_created, triggers, tools, mutating)`, `get_skill`→`{name,description,category,version,triggers,tools,mutating,body,pinned,agent_created,state}`, `list_skills(include_archived)`, `patch_skill(name, old_string, new_string, file_path, replace_all)`, `archive_skill`, `restore_skill`, `set_pinned`. `_exec_tool` branches and routes call only these signatures; the `skill_view` handler reuses `_skill_dir` exactly as defined in Task 4. `render_skill`/`_yaml_scalar` are JSON-symmetric for list/bool frontmatter values (Task 1 + Task 4 fixed together) so `triggers`/`tools`/`mutating` survive write→read; `import json` is in the Task 1 module header.
 
+## Post-Execution Review Hardening (Unit A, applied)
+
+Two-stage review of Tasks 0–5 found and fixed (commit `2ac8e00`): C1 path-traversal
+in `patch_skill` (now `.resolve()`s target + skill root before the guard); I1
+asymmetric unquote (`_unquote` strips only a matched surrounding pair, replacing
+`str.strip("\"'")`); I2 archive dup-check now scans all categories
+(`_archived_skill_dir`) + `restore_skill` rejects an active-name collision; I3
+`_load_usage()` hoisted out of `list_skills` loops; m1 dead `current` var removed;
+m3 test asserts `index_skill` is invoked. Deliberately declined with rationale:
+m2 (key-scoped bool coercion = parser/schema coupling for a low-probability edge),
+m4 (`_TMP_HOME` leak matches existing repo test pattern), m5 (floor-only pin
+matches repo `requirements.txt` convention). Result: 16 tests pass; code-quality
+re-review APPROVED.
+
 **Note for executor:** Implementation must run on a clean branch off `main` (the current `feat/import-review-gate` branch carries unrelated uncommitted changes — see spec §11). Create the branch before Task 0.
