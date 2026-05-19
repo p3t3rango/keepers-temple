@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import subprocess
@@ -48,6 +49,8 @@ from mempalace.searcher import search_memories
 
 import mcp_client
 import skill_store
+
+logger = logging.getLogger(__name__)
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_ROOM = "general"
@@ -2079,6 +2082,50 @@ def _format_memory_block(hits: list[dict]) -> str:
         parts.append(f"\n[memory {i} | {wing}/{room} | similarity={sim}]\n{text}")
     parts.append("\n--- end memories ---")
     return "\n".join(parts)
+
+
+SKILLS_INDEX_CHAR_CAP = 2000  # ~600 tokens, hard ceiling for the skills block
+
+
+def _format_skills_index(limit: int) -> str:
+    """Compact <available_skills> block: name+description only, pinned first.
+
+    Best-effort: returns "" on any error or when there are no active skills.
+    Body is never included (progressive disclosure via the skill_view tool).
+    """
+    try:
+        skills = skill_store.list_skills(include_archived=False)
+    except Exception:
+        logger.warning("skills index: list_skills failed", exc_info=True)
+        return ""
+    if not skills:
+        return ""
+    skills.sort(key=lambda s: (not s.get("pinned"), s.get("category", ""),
+                               s.get("name", "")))
+    lines = []
+    used = 0
+    shown = 0
+    for s in skills:
+        if shown >= max(1, int(limit)):
+            break
+        line = f"- {s['name']}: {s.get('description', '')}"
+        if used + len(line) + 1 > SKILLS_INDEX_CHAR_CAP:
+            break
+        lines.append(line)
+        used += len(line) + 1
+        shown += 1
+    remaining = len(skills) - shown
+    if remaining > 0:
+        lines.append(f"… ({remaining} more skills; use skill_view to discover)")
+    body = "\n".join(lines)
+    return (
+        "<available_skills>\n"
+        f"{body}\n"
+        "Before replying, scan the skills above. If one is relevant or even "
+        "partially applies, you MUST load it with skill_view(name) before "
+        "acting. Do not guess a procedure a skill already documents.\n"
+        "</available_skills>"
+    )
 
 
 async def _extract_kg_triples(model: str, transcript: str) -> list[dict]:
