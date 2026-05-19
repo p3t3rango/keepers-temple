@@ -79,3 +79,23 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     if not body.strip():
         raise SkillError("skill body is empty")
     return meta, body
+
+
+_DANGER_PATTERNS = [
+    r"ignore\s+(all\s+)?previous\s+instructions",
+    r"disregard\s+(the\s+)?(system|above)\s+prompt",
+    r"curl\s+https?://\S+\s*\|\s*(ba)?sh",
+    r"wget\s+https?://\S+\s*\|\s*(ba)?sh",
+    r"rm\s+-rf\s+/(?:\s|$|--)",
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    r"exfiltrat",
+]
+
+
+def security_scan(text: str) -> Optional[str]:
+    """Return a human-readable reason if the content is unsafe, else None."""
+    s = str(text)
+    for pat in _DANGER_PATTERNS:
+        if re.search(pat, s, re.IGNORECASE):
+            return f"blocked: content matched unsafe pattern /{pat}/"
+    return None
