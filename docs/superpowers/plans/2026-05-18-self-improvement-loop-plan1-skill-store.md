@@ -105,6 +105,17 @@ if _REPO_ROOT not in sys.path:
 import skill_store as ss  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _clean_skills():
+    """Isolate the skill-store filesystem between tests (mirrors the
+    _clean_pending pattern in tests/test_app_review_endpoints.py)."""
+    import shutil
+    shutil.rmtree(
+        os.path.join(_TMP_HOME, ".mempalace", "skills"), ignore_errors=True
+    )
+    yield
+
+
 def test_slugify_normalizes():
     assert ss.slugify("Deploy Keepers Temple!") == "deploy-keepers-temple"
     assert ss.slugify("  multiple   spaces ") == "multiple-spaces"
