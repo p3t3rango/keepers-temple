@@ -108,3 +108,12 @@ def test_skills_list_include_archived(client):
     assert client.get("/api/skills").json()["total"] == 0
     full = client.get("/api/skills?include_archived=true").json()
     assert "ar" in [s["name"] for s in full["skills"]]
+
+
+def test_wakeup_includes_skills_block(client):
+    client.post("/api/skills", json={
+        "name": "wk", "description": "wakeup skill", "body": "## Contract\nx\n"})
+    r = client.get("/api/wakeup")
+    assert r.status_code == 200
+    assert "<available_skills>" in r.json()["text"]
+    assert "wk:" in r.json()["text"]

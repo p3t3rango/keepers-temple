@@ -1609,6 +1609,9 @@ async def get_wakeup(wing: Optional[str] = None):
     try:
         stack = MemoryStack(palace_path=PALACE_PATH)
         text = stack.wake_up(wing=wing)
+        skills_block = _format_skills_index(15)
+        if skills_block:
+            text = f"{text}\n\n{skills_block}"
         return {"text": text, "tokens_estimate": len(text) // 4, "wing": wing}
     except Exception as e:
         return {"text": "", "tokens_estimate": 0, "wing": wing, "error": str(e)}
