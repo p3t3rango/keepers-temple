@@ -277,6 +277,28 @@ def get_skill(name: str) -> dict:
     }
 
 
+def read_skill_file(name: str, file_path: str) -> str:
+    """Read a file inside a skill's directory (active or archived).
+
+    Containment-guarded: rejects path traversal outside the skill dir.
+    Raises SkillError on missing skill, missing/empty file_path, or escape.
+    """
+    slug = slugify(name)
+    d = _skill_dir(slug) or _archived_skill_dir(slug)
+    if d is None:
+        raise SkillError(f"skill '{slug}' not found")
+    if not file_path:
+        raise SkillError("file_path is required")
+    target = d / file_path
+    resolved = target.resolve()
+    skill_root = d.resolve()
+    if not target.exists() or (
+        skill_root not in resolved.parents and resolved != skill_root / "SKILL.md"
+    ):
+        raise SkillError(f"file not found: {file_path}")
+    return target.read_text()
+
+
 def list_skills(include_archived: bool = False) -> list[dict]:
     out = []
     usage = _load_usage()

@@ -199,3 +199,38 @@ def test_exec_tool_skill_manage_and_view(monkeypatch):
     assert app_module._exec_tool(
         "skill_manage", {"action": "bogus", "name": "t1"}, "personal", None
     ).get("error")
+
+
+def test_read_skill_file_blocks_traversal_and_missing():
+    ss.create_skill(name="rf", description="d", body="hello world\n", category="c1")
+    assert "hello world" in ss.read_skill_file("rf", "SKILL.md")
+    with pytest.raises(ss.SkillError):
+        ss.read_skill_file("rf", "../../../etc/hosts")
+    with pytest.raises(ss.SkillError):
+        ss.read_skill_file("rf", "nope.md")
+    with pytest.raises(ss.SkillError):
+        ss.read_skill_file("missing-skill", "SKILL.md")
+
+
+def test_exec_tool_skill_view_filepath_guard(monkeypatch):
+    sys.path.insert(0, os.path.join(_REPO_ROOT, "mempalace-src"))
+    import app as app_module  # noqa: E402
+    monkeypatch.setattr("skill_store.index_skill", lambda n, d, p: None)
+    app_module._exec_tool(
+        "skill_manage",
+        {"action": "create", "name": "vv", "description": "d",
+         "body": "## Contract\nbody\n"},
+        "personal", None,
+    )
+    ok = app_module._exec_tool(
+        "skill_view", {"name": "vv", "file_path": "SKILL.md"}, "personal", None
+    )
+    assert "Contract" in ok["body"] and ok["file"] == "SKILL.md"
+    bad = app_module._exec_tool(
+        "skill_view", {"name": "vv", "file_path": "../../../etc/hosts"},
+        "personal", None,
+    )
+    assert bad.get("error")
+    assert app_module._exec_tool(
+        "skill_view", {"name": ""}, "personal", None
+    ).get("error")

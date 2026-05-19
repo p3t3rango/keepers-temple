@@ -1897,17 +1897,19 @@ def _exec_tool(
                 topic=str(args.get("topic") or "general"),
             )
         if name == "skill_view":
+            sk_name = str(args.get("name") or "").strip()
+            if not sk_name:
+                return {"error": "name is required"}
             try:
-                sk = skill_store.get_skill(str(args.get("name") or ""))
+                if args.get("file_path"):
+                    body = skill_store.read_skill_file(
+                        sk_name, str(args["file_path"])
+                    )
+                    return {"name": skill_store.slugify(sk_name),
+                            "file": str(args["file_path"]), "body": body}
+                sk = skill_store.get_skill(sk_name)
             except skill_store.SkillError as e:
                 return {"error": str(e)}
-            if args.get("file_path"):
-                d = skill_store._skill_dir(sk["name"])
-                fp = (d / str(args["file_path"])) if d else None
-                if not fp or not fp.exists():
-                    return {"error": f"file not found: {args['file_path']}"}
-                return {"name": sk["name"], "file": str(args["file_path"]),
-                        "body": fp.read_text()}
             return {"name": sk["name"], "description": sk["description"],
                     "body": sk["body"], "state": sk["state"]}
         if name == "skill_manage":
@@ -1926,9 +1928,12 @@ def _exec_tool(
                     )
                     return {"ok": True, "name": r["name"], "action": "create"}
                 if action == "patch":
+                    old_s = str(args.get("old_string") or "")
+                    if not old_s:
+                        return {"error": "old_string is required for patch"}
                     r = skill_store.patch_skill(
                         name=str(args.get("name") or ""),
-                        old_string=str(args.get("old_string") or ""),
+                        old_string=old_s,
                         new_string=str(args.get("new_string") or ""),
                         file_path=args.get("file_path"),
                         replace_all=bool(args.get("replace_all", False)),
