@@ -71,3 +71,24 @@ def test_skills_index_char_cap_truncates():
     assert "more skills" in out  # truncation actually fired
     assert "<available_skills>" in out and "</available_skills>" in out
     assert len(out) <= app_module.SKILLS_INDEX_CHAR_CAP + 310
+
+
+def _req(**kw):
+    base = dict(model="m", messages=[{"role": "user", "content": "hi"}])
+    base.update(kw)
+    return app_module.ChatRequest(**base)
+
+
+def test_compose_skill_message_gating():
+    assert app_module._compose_skill_message(_req(use_skills=True)) is None
+    ss.create_skill(name="k", description="d", body="b\n")
+    assert app_module._compose_skill_message(_req(use_skills=False)) is None
+    msg = app_module._compose_skill_message(_req(use_skills=True, skill_limit=15))
+    assert msg["role"] == "system"
+    assert "<available_skills>" in msg["content"] and "k:" in msg["content"]
+
+
+def test_chatrequest_defaults():
+    r = _req()
+    assert r.use_skills is True
+    assert r.skill_limit == 15

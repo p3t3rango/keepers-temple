@@ -109,6 +109,8 @@ class ChatRequest(BaseModel):
     system_prompt: Optional[str] = None
     session_id: Optional[str] = None
     memory_limit: int = Field(default=5, ge=1, le=20)
+    use_skills: bool = True
+    skill_limit: int = Field(default=15, ge=1, le=50)
     persona: Optional[str] = None
     # Context window handling. When True, the server auto-summarizes older
     # message pairs before sending if the prompt would exceed
@@ -2128,6 +2130,16 @@ def _format_skills_index(limit: int) -> str:
     )
 
 
+def _compose_skill_message(req: "ChatRequest"):
+    """Return the skills system-message dict, or None when disabled/empty."""
+    if not req.use_skills:
+        return None
+    block = _format_skills_index(req.skill_limit)
+    if not block:
+        return None
+    return {"role": "system", "content": block}
+
+
 async def _extract_kg_triples(model: str, transcript: str) -> list[dict]:
     """Use a small fast LLM to pull subject/predicate/object triples from a transcript."""
     prompt = (
@@ -2276,6 +2288,10 @@ async def chat(req: ChatRequest):
     memory_block = _format_memory_block(memory_hits)
     if memory_block:
         out_messages.append({"role": "system", "content": memory_block})
+
+    _skill_msg = _compose_skill_message(req)
+    if _skill_msg is not None:
+        out_messages.append(_skill_msg)
 
     chat_msgs: list[dict] = []
     for m in req.messages:
