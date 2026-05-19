@@ -216,25 +216,45 @@ def deindex_skill(name: str) -> None:
 
     Never raises (mirrors index_skill); WARNING-logs on failure. Matches by
     content prefix '<slug>: ' since the index drawer content is
-    f"{slug}: {description}" (see index_skill).
+    f"{slug}: {description}" (see index_skill). index_skill appends on every
+    create/patch, so there may be multiple matching drawers across pages.
     """
     slug = slugify(name)
     try:
         from mempalace.mcp_server import tool_list_drawers, tool_delete_drawer
 
-        listing = tool_list_drawers(
-            wing=SKILL_INDEX_WING, room=SKILL_INDEX_ROOM
-        )
-        drawers = listing.get("drawers", []) if isinstance(listing, dict) else []
+        found = 0
         removed = 0
-        for d in drawers:
-            preview = (d.get("content_preview") or "")
-            if preview.startswith(f"{slug}: "):
-                res = tool_delete_drawer(d.get("drawer_id"))
-                if isinstance(res, dict) and res.get("success"):
-                    removed += 1
-        if removed == 0:
-            logger.warning("deindex_skill: no kt-skills drawer found for %r", slug)
+        offset = 0
+        page = 100
+        for _ in range(1000):  # hard safety bound on pagination
+            listing = tool_list_drawers(
+                wing=SKILL_INDEX_WING, room=SKILL_INDEX_ROOM,
+                limit=page, offset=offset,
+            )
+            drawers = (
+                listing.get("drawers", []) if isinstance(listing, dict) else []
+            )
+            if not drawers:
+                break
+            for d in drawers:
+                if (d.get("content_preview") or "").startswith(f"{slug}: "):
+                    found += 1
+                    res = tool_delete_drawer(d.get("drawer_id"))
+                    if isinstance(res, dict) and res.get("success"):
+                        removed += 1
+                    else:
+                        logger.warning(
+                            "deindex_skill: delete failed for drawer %r: %s",
+                            d.get("drawer_id"), res,
+                        )
+            if len(drawers) < page:
+                break
+            offset += page
+        if found == 0:
+            logger.warning(
+                "deindex_skill: no kt-skills drawer found for %r", slug
+            )
     except Exception:
         logger.warning("deindex_skill errored for %r", slug, exc_info=True)
 
@@ -444,6 +464,8 @@ def archive_skill(name: str) -> dict:
         shutil.rmtree(dest)
     shutil.move(str(d), str(dest))
     _touch_usage(slug, archived=True)
+    # Best-effort: a crash between the dir move above and here leaves a stale
+    # index entry; acceptable since the index is non-authoritative.
     deindex_skill(slug)
     return {"name": slug, "state": "archived"}
 

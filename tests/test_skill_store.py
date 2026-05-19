@@ -259,7 +259,5 @@ def test_archive_deindexes_and_restore_reindexes(monkeypatch):
     ss.create_skill(name="lc", description="d", body="b\n", category="ops")
     ss.archive_skill("lc")
     ss.restore_skill("lc")
-    assert ("deindex", "lc") in calls
-    assert calls.count(("index", "lc")) >= 1
-    assert calls.index(("deindex", "lc")) < calls.index(("index", "lc"), 1) \
-        if calls.count(("index", "lc")) > 1 else True
+    # create indexes once; archive deindexes; restore re-indexes — in order.
+    assert calls == [("index", "lc"), ("deindex", "lc"), ("index", "lc")]
