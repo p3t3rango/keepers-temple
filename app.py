@@ -550,6 +550,21 @@ async def list_attachments(wing: str):
     }
 
 
+def _aggregate_palace(all_meta: list) -> tuple[dict, dict]:
+    """Count drawers per wing/room, excluding the internal kt-skills index
+    so it is never offered to the model/UI as a reusable memory topic."""
+    wings: dict[str, int] = {}
+    rooms: dict[str, int] = {}
+    for m in all_meta:
+        w = (m or {}).get("wing", "unknown")
+        if w == skill_store.SKILL_INDEX_WING:
+            continue
+        r = (m or {}).get("room", "unknown")
+        wings[w] = wings.get(w, 0) + 1
+        rooms[r] = rooms.get(r, 0) + 1
+    return wings, rooms
+
+
 @app.get("/api/stats")
 async def palace_stats():
     col = _safe_collection()
@@ -559,13 +574,7 @@ async def palace_stats():
         all_meta = col.get(include=["metadatas"]).get("metadatas") or []
     except Exception as e:
         return {"total": 0, "wings": {}, "rooms": {}, "error": str(e)}
-    wings: dict[str, int] = {}
-    rooms: dict[str, int] = {}
-    for m in all_meta:
-        w = (m or {}).get("wing", "unknown")
-        r = (m or {}).get("room", "unknown")
-        wings[w] = wings.get(w, 0) + 1
-        rooms[r] = rooms.get(r, 0) + 1
+    wings, rooms = _aggregate_palace(all_meta)
     try:
         total = col.count()
     except Exception:

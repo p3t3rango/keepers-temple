@@ -124,6 +124,19 @@ def test_conversation_search_in_tools_list():
     assert "conversation_search" in names
 
 
+def test_aggregate_palace_excludes_kt_skills():
+    meta = [
+        {"wing": "personal", "room": "general"},
+        {"wing": "personal", "room": "general"},
+        {"wing": "kt-skills", "room": "index"},
+        {"wing": "work", "room": "decisions"},
+    ]
+    wings, rooms = app_module._aggregate_palace(meta)
+    assert "kt-skills" not in wings
+    assert wings == {"personal": 2, "work": 1}
+    assert "index" not in rooms  # the kt-skills row is skipped entirely
+
+
 def test_conversation_search_clamps_n_to_ten(monkeypatch):
     # 15 chat-source hits returned; tool must cap at 10 even if caller asks 50.
     fake_hits = [
