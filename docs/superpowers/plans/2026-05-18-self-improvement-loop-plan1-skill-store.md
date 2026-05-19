@@ -1185,4 +1185,21 @@ m4 (`_TMP_HOME` leak matches existing repo test pattern), m5 (floor-only pin
 matches repo `requirements.txt` convention). Result: 16 tests pass; code-quality
 re-review APPROVED.
 
+**Unit B (Task 6) hardening, applied (commit `e932ae8`):** review found a Critical
+read-anywhere path traversal in `skill_view`'s `file_path` branch (raw
+`d / file_path` read) plus an Important leaky use of private `_skill_dir` from
+`app.py`. Fixed by adding a public, containment-guarded
+`skill_store.read_skill_file(name, file_path)` (same `.resolve()`+parents guard as
+`patch_skill`, supports active+archived skills); `app.py` `skill_view` rewritten
+to use it (no `_skill_dir` reference remains), plus `name`-required and
+patch `old_string`-required guards. 19 tests pass; code-quality re-review APPROVED.
+Open minor (non-blocking, deferred to Unit C): add an `_exec_tool`-level test for
+the empty-`old_string` patch guard.
+
+**Anchor note:** on this branch `app.py` is the clean-`main` variant — the plan's
+line numbers (from the review-gate working tree) do not apply; locate insertion
+points by code anchor (`import mcp_client`, the `TOOLS` list close, the
+`unknown tool` fallthrough in sync `_exec_tool`, `IdentityBody`,
+`app.mount("/static"...)`).
+
 **Note for executor:** Implementation must run on a clean branch off `main` (the current `feat/import-review-gate` branch carries unrelated uncommitted changes — see spec §11). Create the branch before Task 0.
