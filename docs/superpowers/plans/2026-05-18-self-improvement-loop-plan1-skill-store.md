@@ -108,11 +108,10 @@ import skill_store as ss  # noqa: E402
 @pytest.fixture(autouse=True)
 def _clean_skills():
     """Isolate the skill-store filesystem between tests (mirrors the
-    _clean_pending pattern in tests/test_app_review_endpoints.py)."""
+    _clean_pending pattern in tests/test_app_review_endpoints.py).
+    Runtime-resolved so it survives cross-module import ordering."""
     import shutil
-    shutil.rmtree(
-        os.path.join(_TMP_HOME, ".mempalace", "skills"), ignore_errors=True
-    )
+    shutil.rmtree(ss.skills_root(), ignore_errors=True)
     yield
 
 
@@ -317,8 +316,9 @@ git commit -m "feat(skills): content security scan"
 def test_usage_state_roundtrip():
     ss._save_usage({"alpha": {"pinned": True}})
     assert ss._load_usage()["alpha"]["pinned"] is True
-    # skills_root is under the redirected HOME
-    assert str(ss.skills_root()).startswith(_TMP_HOME)
+    # skills_root is under the redirected HOME (runtime-resolved so the
+    # assertion is import-order independent across test modules)
+    assert str(ss.skills_root()).startswith(os.path.expanduser("~"))
     assert ss.skills_root().name == "skills"
 ```
 
@@ -987,6 +987,15 @@ def _no_palace(monkeypatch):
     monkeypatch.setattr(skill_store, "index_skill", lambda n, d, p: None)
 
 
+@pytest.fixture(autouse=True)
+def _clean_skills():
+    # Runtime-resolved (mirrors _clean_pending) so per-test FS isolation holds
+    # regardless of cross-module import order.
+    import shutil
+    shutil.rmtree(skill_store.skills_root(), ignore_errors=True)
+    yield
+
+
 @pytest.fixture
 def client():
     return TestClient(app_module.app)
@@ -1194,7 +1203,22 @@ read-anywhere path traversal in `skill_view`'s `file_path` branch (raw
 to use it (no `_skill_dir` reference remains), plus `name`-required and
 patch `old_string`-required guards. 19 tests pass; code-quality re-review APPROVED.
 Open minor (non-blocking, deferred to Unit C): add an `_exec_tool`-level test for
-the empty-`old_string` patch guard.
+the empty-`old_string` patch guard (done in Unit C).
+
+**Unit C (Tasks 7–8) hardening, applied (commit `c5f417f`):** review found a
+Critical cross-module test-isolation bug (module-level `HOME`/`_TMP_HOME` capture
+broke under reverse collection order) and Important wrong HTTP status semantics
+(`patch` on missing skill → 400, `restore` conflict → 404). Fixed by: typed
+`SkillNotFoundError`/`SkillConflictError` subclasses of `SkillError`, mapped in
+routes (create→409/400, patch→404/400, restore→409/404, subclass-`except` before
+base); both `_clean_skills` fixtures + the `test_usage_state_roundtrip` assertion
+now runtime-resolve the active path (import-order independent); bounded
+`SkillCreateBody`/`SkillPatchBody` via `Field(min/max_length)` incl.
+`old_string` min_length parity with the tool path; 5 added error-path endpoint
+tests. 28 tests pass in BOTH collection orderings; code-quality re-review
+APPROVED. (Task 8's regression step is satisfied by the full local suite + clean
+`app` import; `tests/test_app_review_endpoints.py` legitimately lives on a
+different branch and is not expected here.)
 
 **Anchor note:** on this branch `app.py` is the clean-`main` variant — the plan's
 line numbers (from the review-gate working tree) do not apply; locate insertion
