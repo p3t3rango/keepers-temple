@@ -2130,7 +2130,7 @@ def _format_skills_index(limit: int) -> str:
     )
 
 
-def _compose_skill_message(req: "ChatRequest"):
+def _compose_skill_message(req: ChatRequest):
     """Return the skills system-message dict, or None when disabled/empty."""
     if not req.use_skills:
         return None
@@ -2289,9 +2289,9 @@ async def chat(req: ChatRequest):
     if memory_block:
         out_messages.append({"role": "system", "content": memory_block})
 
-    _skill_msg = _compose_skill_message(req)
-    if _skill_msg is not None:
-        out_messages.append(_skill_msg)
+    skill_msg = _compose_skill_message(req)
+    if skill_msg is not None:
+        out_messages.append(skill_msg)
 
     chat_msgs: list[dict] = []
     for m in req.messages:
