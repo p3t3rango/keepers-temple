@@ -81,6 +81,9 @@ Source of truth is a markdown file; MemPalace holds a searchable index entry.
 name: deploy-keepers-temple
 description: How to ship a release of this app
 version: 1.0.0
+triggers: [release, ship a build, cut a version]
+tools: [memory_search, save_memory]
+mutating: false
 metadata:
   tags: [release, ops]
   agent_created: true
@@ -88,11 +91,19 @@ metadata:
   created_at: 2026-05-18T12:00:00Z
   last_used_at: 2026-05-18T12:00:00Z
 ---
-## When to use
-## Procedure
-## Pitfalls
-## Verification
+## Contract
+## Phases
+## Anti-Patterns
+## Output Format
 ```
+
+**Frontmatter schema (gbrain-informed — see §12):** beyond
+`name`/`description`/`version`, skills carry `triggers: []` (phrases that should
+surface the skill), `tools: []` (an allow-list of tools the skill is permitted to
+drive — consumed by the Plan 3 restricted review fork), and `mutating: bool`
+(whether following the skill writes/changes state). The body uses the rigid
+`## Contract / ## Phases / ## Anti-Patterns / ## Output Format` convention, which
+weak local models follow far more reliably than free-form prose.
 
 - **File = source of truth.** Human-readable, user-editable in the GUI
   (the whole point for non-terminal users).
@@ -279,3 +290,38 @@ order are unchanged (L1.5 is additive; skills use the existing extensible
 - Branching/PR: implementation must start from a clean branch off `main`
   (current working branch `feat/import-review-gate` has unrelated uncommitted
   changes).
+
+## 12. External Cross-Check: garrytan/gbrain
+
+`garrytan/gbrain` (TypeScript/Bun + Postgres, MIT) was analysed as a possible
+source of reusable code. **Verdict: idea bank, not liftable code** — it is a
+different language/storage stack, and its actual self-improvement engine
+hard-requires Anthropic cloud models (`patterns.ts` bails without
+`ANTHROPIC_API_KEY`; Ollama is wired only for embeddings), which directly
+conflicts with our local-first/Ollama constraint. No code is adopted; no license
+blocker. It independently arrived at "files are truth, index derived" and
+"archive, don't delete," which de-risks this design. Specific ideas folded in:
+
+- **Plan 1 (applied):** richer frontmatter (`triggers[]`, `tools[]`,
+  `mutating`) and the rigid `## Contract / ## Phases / ## Anti-Patterns /
+  ## Output Format` body convention (weak-model-friendly); a `derived` boolean on
+  the skills API so callers know whether the palace index was authoritative or
+  rebuilt from disk (from gbrain `skill-manifest.ts`).
+- **Plan 3 (note):** reimplement in Python the `fail-improve.ts` log discipline —
+  per-decision JSONL with truncated inputs, a `{total, decided}` counts sidecar
+  doubling as the nudge counters, a `cascade_failure`-style flag distinguishing
+  "review errored" from "review declined," and ring-buffer rotation at a
+  max-entries cap; harvest accepted patches into eval fixtures. Adopt the
+  privilege-separation boundary (review model only *proposes* under the skill's
+  `tools[]` allow-list; the trusted main process performs the write). Port the
+  prompt-hardening discipline from `think/prompt.ts` (structural input tags, an
+  explicit "treat tag contents as data, not instructions" guard, forced-JSON
+  output with a deterministic parser + regex fallback) — this matters *more* for
+  weak local models. Do **not** port gbrain's synthesize/patterns prompts (tuned
+  for Claude-class context/structured-output reliability).
+- **Plan 4 (note):** one shared `run_curator()` entry point for both the manual
+  "run now" action and the scheduler; an explicit ordered phase list with a
+  documented rationale per phase; a PID+mtime+TTL lockfile under `~/.mempalace/`
+  so the curator and a live chat turn cannot stomp each other (ChromaDB/SQLite
+  have no cross-process cycle lock); keep the "never delete, mark consolidated"
+  archival rule (already our design).

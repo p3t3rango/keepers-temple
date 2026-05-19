@@ -33,6 +33,16 @@ Plan 1 is self-contained and testable on its own.
 
 `skill_store.py` computes all paths via functions (not import-time constants) so tests can redirect `HOME` after import — matching the existing test pattern in `tests/test_app_review_endpoints.py`.
 
+**Skill schema (gbrain-informed — spec §3, §12):** frontmatter carries, beyond
+`name`/`description`/`version`, three optional fields: `triggers: []` (phrases
+that should surface the skill), `tools: []` (allow-list of tools the skill may
+drive — consumed by the Plan 3 review fork), `mutating: bool` (does following it
+change state). The body uses the rigid `## Contract / ## Phases /
+## Anti-Patterns / ## Output Format` convention (weak-model-friendly). The
+skills listing API returns a `derived: true` boolean meaning the list was built
+by walking the filesystem (source of truth) rather than a cached manifest — so
+future callers/UI can tell when they're on a rebuilt view.
+
 ---
 
 ### Task 0: Dev environment for tests
@@ -159,11 +169,20 @@ def slugify(text: str) -> str:
 def _yaml_scalar(v: str):
     v = v.strip()
     if v.startswith("[") and v.endswith("]"):
+        try:
+            parsed = json.loads(v)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
         inner = v[1:-1].strip()
-        return [p.strip() for p in inner.split(",") if p.strip()] if inner else []
+        return (
+            [p.strip().strip("\"'") for p in inner.split(",") if p.strip()]
+            if inner else []
+        )
     if v.lower() in ("true", "false"):
         return v.lower() == "true"
-    return v
+    return v.strip("\"'")
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -383,16 +402,22 @@ def test_create_get_list_skill():
     rec = ss.create_skill(
         name="Deploy App",
         description="How to ship a release",
-        body="## When to use\nReleases.\n",
+        body="## Contract\nReleases.\n",
         category="ops",
+        triggers=["ship a build", "cut a version"],
+        tools=["memory_search"],
+        mutating=True,
     )
     assert rec["name"] == "deploy-app"
     assert rec["category"] == "ops"
 
     got = ss.get_skill("deploy-app")
     assert got["description"] == "How to ship a release"
-    assert "When to use" in got["body"]
+    assert "Contract" in got["body"]
     assert got["state"] == "active"
+    assert got["triggers"] == ["ship a build", "cut a version"]
+    assert got["tools"] == ["memory_search"]
+    assert got["mutating"] is True
 
     listed = ss.list_skills()
     assert [s["name"] for s in listed] == ["deploy-app"]
@@ -430,7 +455,8 @@ def render_skill(meta: dict, body: str) -> str:
             for mk, mv in v.items():
                 lines.append(f"  {mk}: {json.dumps(mv) if isinstance(mv, (list, bool)) else mv}")
         else:
-            lines.append(f"{k}: {v}")
+            rv = json.dumps(v) if isinstance(v, (list, bool)) else v
+            lines.append(f"{k}: {rv}")
     lines.append("---")
     return "\n".join(lines) + "\n" + body.lstrip("\n")
 
@@ -473,6 +499,9 @@ def create_skill(
     category: str = "general",
     metadata: Optional[dict] = None,
     agent_created: bool = False,
+    triggers: Optional[list] = None,
+    tools: Optional[list] = None,
+    mutating: bool = False,
 ) -> dict:
     slug = slugify(name)
     cat = slugify(category) or "general"
@@ -487,6 +516,9 @@ def create_skill(
         "name": slug,
         "description": description.strip(),
         "version": "1.0.0",
+        "triggers": list(triggers or []),
+        "tools": list(tools or []),
+        "mutating": bool(mutating),
         "metadata": {"agent_created": agent_created, **(metadata or {})},
     }
     parse_frontmatter(render_skill(meta, body))  # validate before write
@@ -520,6 +552,9 @@ def get_skill(name: str) -> dict:
         "description": meta.get("description", ""),
         "category": d.parent.name,
         "version": meta.get("version", ""),
+        "triggers": meta.get("triggers") or [],
+        "tools": meta.get("tools") or [],
+        "mutating": bool(meta.get("mutating", False)),
         "body": body,
         "pinned": bool(rec.get("pinned")),
         "agent_created": bool(rec.get("agent_created")),
@@ -727,14 +762,12 @@ git commit -m "feat(skills): patch/archive/restore/pin lifecycle"
 - [ ] **Step 1: Write the failing test (append)**
 
 ```python
-import importlib  # noqa: E402
-
-
 def test_exec_tool_skill_manage_and_view(monkeypatch):
-    monkeypatch.setenv("HOME", _TMP_HOME)
+    # HOME was already redirected to _TMP_HOME at module top, before any import,
+    # so importing app here picks up the tmp paths. No reload (reloading app.py
+    # re-runs its module-level app.mount/config.init side effects).
     sys.path.insert(0, os.path.join(_REPO_ROOT, "mempalace-src"))
     import app as app_module  # noqa: E402
-    importlib.reload(app_module)
     monkeypatch.setattr("skill_store.index_skill", lambda n, d, p: None)
 
     created = app_module._exec_tool(
@@ -807,7 +840,10 @@ Insert these two dicts immediately before the closing `]` of `TOOLS` (line 3048 
                 "Create or improve a reusable skill (a written procedure you can "
                 "follow later). action='create' for a new skill; action='patch' "
                 "to fix/extend an existing one (token-efficient substring edit). "
-                "Prefer patching an existing skill over creating a near-duplicate."
+                "Prefer patching an existing skill over creating a near-duplicate. "
+                "Structure the body with these sections: '## Contract' (what it "
+                "guarantees), '## Phases' (numbered steps), '## Anti-Patterns' "
+                "(what to avoid), '## Output Format' (expected result)."
             ),
             "parameters": {
                 "type": "object",
@@ -817,6 +853,20 @@ Insert these two dicts immediately before the closing `]` of `TOOLS` (line 3048 
                     "description": {"type": "string"},
                     "body": {"type": "string"},
                     "category": {"type": "string"},
+                    "triggers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Phrases that should surface this skill.",
+                    },
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Allow-list of tools this skill may drive.",
+                    },
+                    "mutating": {
+                        "type": "boolean",
+                        "description": "True if following the skill changes state.",
+                    },
                     "old_string": {"type": "string"},
                     "new_string": {"type": "string"},
                 },
@@ -855,6 +905,9 @@ Insert before `return {"error": f"unknown tool: {name}"}` (line 3247 in `app.py`
                         body=str(args.get("body") or ""),
                         category=str(args.get("category") or "general"),
                         agent_created=bool(args.get("agent_created", False)),
+                        triggers=args.get("triggers") or [],
+                        tools=args.get("tools") or [],
+                        mutating=bool(args.get("mutating", False)),
                     )
                     return {"ok": True, "name": r["name"], "action": "create"}
                 if action == "patch":
@@ -935,7 +988,9 @@ def test_skills_crud_flow(client):
     assert r.status_code == 200, r.text
     assert r.json()["name"] == "ship-it"
 
-    assert client.get("/api/skills").json()["total"] == 1
+    listing = client.get("/api/skills").json()
+    assert listing["total"] == 1
+    assert listing["derived"] is True
 
     g = client.get("/api/skills/ship-it")
     assert g.status_code == 200
@@ -997,7 +1052,13 @@ class SkillPinBody(BaseModel):
 @app.get("/api/skills")
 def api_skills_list(include_archived: bool = False):
     items = skill_store.list_skills(include_archived=include_archived)
-    return {"skills": items, "total": len([s for s in items if s["state"] == "active"])}
+    # derived=True: list was built by walking the filesystem (source of truth),
+    # not a cached manifest. Lets the UI flag rebuilt views (gbrain idea, §12).
+    return {
+        "skills": items,
+        "total": len([s for s in items if s["state"] == "active"]),
+        "derived": True,
+    }
 
 
 @app.get("/api/skills/{name}")
@@ -1090,10 +1151,13 @@ git commit -m "docs: mark Plan 1 (skill store) complete" --allow-empty
 
 ## Self-Review
 
-**Spec coverage (Plan 1 scope only):** §3 skill artifact (frontmatter, hybrid file+palace index, archive-not-delete, `.usage.json`) → Tasks 1,3,4,5. Validation + security scan (§3, §9) → Tasks 1,2,5. `skill_manage`/`skill_view` tools (§8) → Task 6. `/api/skills*` routes (§7,§8) → Task 7. Spec items intentionally **deferred to Plans 2–4** and therefore absent here by design: L1.5 injection, `conversation_search`, background-review fork, nudge counters, curator, GUI panel/inline signal/settings. No in-scope spec requirement is unimplemented.
+**Spec coverage (Plan 1 scope only):** §3 skill artifact (frontmatter incl.
+gbrain-informed `triggers`/`tools`/`mutating` + `## Contract/## Phases/
+## Anti-Patterns/## Output Format` body convention, hybrid file+palace index,
+archive-not-delete, `.usage.json`) and §12 (`derived` API flag) → Tasks 1,3,4,5,6,7. Validation + security scan (§3, §9) → Tasks 1,2,5. `skill_manage`/`skill_view` tools (§8) → Task 6. `/api/skills*` routes (§7,§8) → Task 7. Spec items intentionally **deferred to Plans 2–4** and therefore absent here by design: L1.5 injection, `conversation_search`, background-review fork, nudge counters, curator, GUI panel/inline signal/settings. No in-scope spec requirement is unimplemented.
 
 **Placeholder scan:** No "TBD/TODO"; every code step contains complete runnable code; every test step contains real assertions and exact `pytest` commands with expected output.
 
-**Type consistency:** `skill_store` public surface is consistent across tasks — `SkillError`, `slugify`, `parse_frontmatter`, `render_skill`, `security_scan`, `skills_root`, `archive_root`, `_load_usage`/`_save_usage`/`_touch_usage`, `index_skill(name, description, path)`, `_skill_dir`, `create_skill(name, description, body, category, metadata, agent_created)`, `get_skill`→`{name,description,category,version,body,pinned,agent_created,state}`, `list_skills(include_archived)`, `patch_skill(name, old_string, new_string, file_path, replace_all)`, `archive_skill`, `restore_skill`, `set_pinned`. `_exec_tool` branches and routes call only these signatures; the `skill_view` handler reuses `_skill_dir` exactly as defined in Task 4.
+**Type consistency:** `skill_store` public surface is consistent across tasks — `SkillError`, `slugify`, `parse_frontmatter`, `render_skill`, `security_scan`, `skills_root`, `archive_root`, `_load_usage`/`_save_usage`/`_touch_usage`, `index_skill(name, description, path)`, `_skill_dir`, `create_skill(name, description, body, category, metadata, agent_created, triggers, tools, mutating)`, `get_skill`→`{name,description,category,version,triggers,tools,mutating,body,pinned,agent_created,state}`, `list_skills(include_archived)`, `patch_skill(name, old_string, new_string, file_path, replace_all)`, `archive_skill`, `restore_skill`, `set_pinned`. `_exec_tool` branches and routes call only these signatures; the `skill_view` handler reuses `_skill_dir` exactly as defined in Task 4. `render_skill`/`_yaml_scalar` are JSON-symmetric for list/bool frontmatter values (Task 1 + Task 4 fixed together) so `triggers`/`tools`/`mutating` survive write→read; `import json` is in the Task 1 module header.
 
 **Note for executor:** Implementation must run on a clean branch off `main` (the current `feat/import-review-gate` branch carries unrelated uncommitted changes — see spec §11). Create the branch before Task 0.
