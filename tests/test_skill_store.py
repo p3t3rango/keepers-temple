@@ -234,3 +234,21 @@ def test_exec_tool_skill_view_filepath_guard(monkeypatch):
     assert app_module._exec_tool(
         "skill_view", {"name": ""}, "personal", None
     ).get("error")
+
+
+def test_exec_tool_patch_requires_old_string(monkeypatch):
+    sys.path.insert(0, os.path.join(_REPO_ROOT, "mempalace-src"))
+    import app as app_module  # noqa: E402
+    monkeypatch.setattr("skill_store.index_skill", lambda n, d, p: None)
+    app_module._exec_tool(
+        "skill_manage",
+        {"action": "create", "name": "po", "description": "d",
+         "body": "## Contract\nx\n"},
+        "personal", None,
+    )
+    res = app_module._exec_tool(
+        "skill_manage",
+        {"action": "patch", "name": "po", "old_string": "", "new_string": "y"},
+        "personal", None,
+    )
+    assert "old_string is required" in (res.get("error") or "")

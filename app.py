@@ -128,6 +128,24 @@ class IdentityBody(BaseModel):
     text: str
 
 
+class SkillCreateBody(BaseModel):
+    name: str
+    description: str
+    body: str
+    category: str = "general"
+
+
+class SkillPatchBody(BaseModel):
+    old_string: str
+    new_string: str
+    file_path: Optional[str] = None
+    replace_all: bool = False
+
+
+class SkillPinBody(BaseModel):
+    pinned: bool
+
+
 class PersonaBody(BaseModel):
     name: str
     description: str = ""
@@ -2499,6 +2517,71 @@ async def chat(req: ChatRequest):
         )
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.get("/api/skills")
+def api_skills_list(include_archived: bool = False):
+    items = skill_store.list_skills(include_archived=include_archived)
+    # derived=True: list was built by walking the filesystem (source of truth),
+    # not a cached manifest. Lets the UI flag rebuilt views (gbrain idea, §12).
+    return {
+        "skills": items,
+        "total": len([s for s in items if s["state"] == "active"]),
+        "derived": True,
+    }
+
+
+@app.get("/api/skills/{name}")
+def api_skill_get(name: str):
+    try:
+        return skill_store.get_skill(name)
+    except skill_store.SkillError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/skills")
+def api_skill_create(body: SkillCreateBody):
+    try:
+        return skill_store.create_skill(
+            name=body.name, description=body.description,
+            body=body.body, category=body.category)
+    except skill_store.SkillError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/skills/{name}/patch")
+def api_skill_patch(name: str, body: SkillPatchBody):
+    try:
+        return skill_store.patch_skill(
+            name=name, old_string=body.old_string,
+            new_string=body.new_string, file_path=body.file_path,
+            replace_all=body.replace_all)
+    except skill_store.SkillError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/skills/{name}/archive")
+def api_skill_archive(name: str):
+    try:
+        return skill_store.archive_skill(name)
+    except skill_store.SkillError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/skills/{name}/restore")
+def api_skill_restore(name: str):
+    try:
+        return skill_store.restore_skill(name)
+    except skill_store.SkillError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/skills/{name}/pin")
+def api_skill_pin(name: str, body: SkillPinBody):
+    try:
+        return skill_store.set_pinned(name, body.pinned)
+    except skill_store.SkillError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
