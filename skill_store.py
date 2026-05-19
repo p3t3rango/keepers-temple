@@ -99,3 +99,51 @@ def security_scan(text: str) -> Optional[str]:
         if re.search(pat, s, re.IGNORECASE):
             return f"blocked: content matched unsafe pattern /{pat}/"
     return None
+
+
+def skills_root() -> Path:
+    p = Path(os.path.expanduser("~/.mempalace/skills"))
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def archive_root() -> Path:
+    p = skills_root() / ".archive"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _usage_path() -> Path:
+    return skills_root() / ".usage.json"
+
+
+def _load_usage() -> dict:
+    try:
+        return json.loads(_usage_path().read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_usage(d: dict) -> None:
+    tmp = _usage_path().with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(d, indent=2))
+    tmp.replace(_usage_path())
+
+
+def _now() -> str:
+    return datetime.now().isoformat()
+
+
+def _touch_usage(name: str, **fields) -> dict:
+    usage = _load_usage()
+    rec = usage.get(name, {})
+    rec.setdefault("created_at", _now())
+    rec.setdefault("agent_created", False)
+    rec.setdefault("pinned", False)
+    rec.setdefault("archived", False)
+    rec.setdefault("patch_count", 0)
+    rec["latest_activity_at"] = _now()
+    rec.update(fields)
+    usage[name] = rec
+    _save_usage(usage)
+    return rec
