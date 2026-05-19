@@ -2108,7 +2108,7 @@ def _format_skills_index(limit: int) -> str:
     for s in skills:
         if shown >= max(1, int(limit)):
             break
-        line = f"- {s['name']}: {s.get('description', '')}"
+        line = f"- {s.get('name', '')}: {s.get('description', '')}"
         if used + len(line) + 1 > SKILLS_INDEX_CHAR_CAP:
             break
         lines.append(line)

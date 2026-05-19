@@ -48,10 +48,11 @@ def test_skills_index_respects_limit_and_char_cap():
     for i in range(8):
         ss.create_skill(name=f"s{i}", description="d" * 50, body="b\n")
     capped = app_module._format_skills_index(3)
-    assert capped.count("\n- ") <= 3 or "more skills" in capped
+    # limit=3 with 8 skills: exactly 3 skill lines + a "more skills" line.
+    assert capped.count("- s") == 3
+    assert "more skills" in capped
     big = app_module._format_skills_index(50)
-    assert len(big) <= app_module.SKILLS_INDEX_CHAR_CAP + 200  # cap + wrapper slack
-    assert "more skills" in big or len(big) <= app_module.SKILLS_INDEX_CHAR_CAP + 200
+    assert len(big) <= app_module.SKILLS_INDEX_CHAR_CAP + 310  # body + more-line + wrapper
 
 
 def test_skills_index_excludes_archived():
@@ -60,3 +61,13 @@ def test_skills_index_excludes_archived():
     ss.archive_skill("gone")
     out = app_module._format_skills_index(15)
     assert "live" in out and "gone" not in out
+
+
+def test_skills_index_char_cap_truncates():
+    # Long descriptions force the SKILLS_INDEX_CHAR_CAP break before `limit`.
+    for i in range(15):
+        ss.create_skill(name=f"s{i:02d}", description="x" * 250, body="b\n")
+    out = app_module._format_skills_index(50)
+    assert "more skills" in out  # truncation actually fired
+    assert "<available_skills>" in out and "</available_skills>" in out
+    assert len(out) <= app_module.SKILLS_INDEX_CHAR_CAP + 310
