@@ -17,6 +17,10 @@ import os
 import tempfile
 from pathlib import Path
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 LOG_DIR = Path(os.path.expanduser("~/.mempalace/skills"))
 LOG_PATH = LOG_DIR / ".decisions.jsonl"
 COUNTS_PATH = LOG_DIR / ".decisions.counts.json"
@@ -42,10 +46,15 @@ def _load_counts() -> dict:
     except FileNotFoundError:
         return {"total": 0, "decided": 0, "noop": 0, "errored": 0}
     except Exception:
+        logger.warning(
+            "decision_log: corrupt counts JSON at %s, resetting",
+            COUNTS_PATH, exc_info=True,
+        )
         return {"total": 0, "decided": 0, "noop": 0, "errored": 0}
 
 
 def _atomic_write(path: Path, data: str) -> None:
+    # Mirror of nudge_state._atomic_write — keep both in sync on bugfix.
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".log.", dir=str(path.parent), suffix=".tmp")
     try:
@@ -73,6 +82,9 @@ def _bump_counts(decision: str) -> None:
 
 
 def _append_line_with_rotation(line: str) -> None:
+    # O(N) per append (reads then rewrites the whole file). Acceptable for
+    # MAX_ENTRIES=500 short JSON lines; switch to truncate-only-on-overflow
+    # if ever raised >> 5k.
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
         existing = LOG_PATH.read_text().splitlines()
@@ -92,8 +104,14 @@ def append(record: dict) -> None:
         _append_line_with_rotation(line)
     except Exception:
         # Last-resort: best-effort, swallow disk errors.
+        logger.warning(
+            "decision_log: line append failed", exc_info=True
+        )
         return
     try:
         _bump_counts(str(rec.get("decision", "noop")))
     except Exception:
+        logger.warning(
+            "decision_log: counts bump failed", exc_info=True
+        )
         return
