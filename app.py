@@ -2348,6 +2348,9 @@ def _format_skills_index(limit: int) -> str:
         "Before replying, scan the skills above. If one is relevant or even "
         "partially applies, you MUST load it with skill_view(name) before "
         "acting. Do not guess a procedure a skill already documents.\n"
+        "If a loaded skill is wrong, stale, or incomplete, patch it in-turn "
+        "with skill_manage(action='patch', name, old_string, new_string) — "
+        "do not wait for the background reviewer.\n"
         "</available_skills>"
     )
 
