@@ -63,3 +63,24 @@ def test_atomic_write_does_not_corrupt_on_partial_failure(monkeypatch, tmp_path)
     assert json.loads(ns.STATE_PATH.read_text()) == good
     # Tempfile from the failed write was cleaned up
     assert not any(tmp_path.glob(".nudge.*.tmp"))
+
+
+def test_bump_by_increments_atomically():
+    ns.bump_by(wing="personal", key="iters_since_skill", n=5)
+    assert ns.load("personal")["iters_since_skill"] == 5
+    # Subsequent bump_by adds, not replaces
+    ns.bump_by(wing="personal", key="iters_since_skill", n=3)
+    assert ns.load("personal")["iters_since_skill"] == 8
+
+
+def test_bump_by_zero_or_negative_is_noop():
+    ns.bump(wing="personal", key="iters_since_skill")
+    ns.bump_by(wing="personal", key="iters_since_skill", n=0)
+    ns.bump_by(wing="personal", key="iters_since_skill", n=-3)
+    assert ns.load("personal")["iters_since_skill"] == 1
+
+
+def test_bump_by_unknown_key_raises():
+    import pytest
+    with pytest.raises(ValueError):
+        ns.bump_by(wing="personal", key="nope", n=1)

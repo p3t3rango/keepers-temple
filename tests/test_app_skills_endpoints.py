@@ -154,15 +154,22 @@ def test_detect_writes_in_tool_results_matches_verified_shapes():
     assert r == {"skill": True, "memory": True}
 
 
-def test_tool_iter_increments_iters_since_skill(monkeypatch, client):
-    import nudge_state
+def test_tool_iter_increments_iters_since_skill(monkeypatch):
     import app as app_module
 
     state = []
-    monkeypatch.setattr(app_module, "_nudge_bump",
-                        lambda wing, key: state.append((wing, key)))
-    monkeypatch.setattr(app_module, "_nudge_reset",
-                        lambda wing, key: state.append(("reset", wing, key)))
+    monkeypatch.setattr(
+        app_module, "_nudge_bump",
+        lambda wing, key: state.append(("bump", wing, key)),
+    )
+    monkeypatch.setattr(
+        app_module, "_nudge_bump_by",
+        lambda wing, key, n: state.append(("bump_by", wing, key, n)),
+    )
+    monkeypatch.setattr(
+        app_module, "_nudge_reset",
+        lambda wing, key: state.append(("reset", wing, key)),
+    )
     monkeypatch.setattr(app_module, "_should_count_skill_iter",
                         lambda combined_tools: True)
     monkeypatch.setattr(app_module, "_detect_writes_in_tool_results",
@@ -174,12 +181,12 @@ def test_tool_iter_increments_iters_since_skill(monkeypatch, client):
         tool_results=[{"ok": True, "name": "foo", "action": "patch"}],
         is_user_turn=True,
     )
-    assert ("personal", "iters_since_skill") in state
-    assert ("personal", "turns_since_memory") in state
+    assert ("bump_by", "personal", "iters_since_skill", 2) in state
+    assert ("bump", "personal", "turns_since_memory") in state
     assert not any(s[0] == "reset" for s in state)
 
 
-def test_skill_write_resets_iters_counter(monkeypatch, client):
+def test_skill_write_resets_iters_counter(monkeypatch):
     import app as app_module
     state = []
     monkeypatch.setattr(app_module, "_nudge_bump",
@@ -203,7 +210,7 @@ def test_skill_write_resets_iters_counter(monkeypatch, client):
     assert ("bump", "personal", "turns_since_memory") in state
 
 
-def test_memory_write_resets_turns_counter(monkeypatch, client):
+def test_memory_write_resets_turns_counter(monkeypatch):
     import app as app_module
     state = []
     monkeypatch.setattr(app_module, "_nudge_bump",

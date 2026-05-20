@@ -75,6 +75,23 @@ def bump(wing: str, key: str) -> int:
     return new_val
 
 
+def bump_by(wing: str, key: str, n: int) -> int:
+    """Increment one counter by N (single read-modify-write); returns new value.
+
+    Faster than calling bump() N times — folds N file ops into one.
+    """
+    if key not in _VALID_KEYS:
+        raise ValueError(f"unknown nudge counter: {key!r}")
+    if n <= 0:
+        return int(load(wing).get(key, 0))
+    state = _load_all()
+    wing_state = state.setdefault(wing, {})
+    new_val = int(wing_state.get(key, 0)) + int(n)
+    wing_state[key] = new_val
+    _atomic_write(state)
+    return new_val
+
+
 def reset(wing: str, key: str) -> None:
     """Zero one counter for one wing."""
     if key not in _VALID_KEYS:

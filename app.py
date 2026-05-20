@@ -48,6 +48,7 @@ from mempalace.palace import get_collection
 from mempalace.searcher import search_memories
 
 import mcp_client
+import nudge_state
 import skill_store
 
 logger = logging.getLogger(__name__)
@@ -1848,8 +1849,6 @@ TOOLS = [
 
 # ─── Nudge counters (Plan 3 background-review fork triggers) ────────────────
 
-import nudge_state  # noqa: E402
-
 
 def _nudge_bump(wing: str, key: str) -> int:
     """Thin wrapper so tests can monkeypatch."""
@@ -1857,6 +1856,17 @@ def _nudge_bump(wing: str, key: str) -> int:
         return nudge_state.bump(wing, key)
     except Exception:
         logger.warning("nudge bump failed (%s/%s)", wing, key, exc_info=True)
+        return 0
+
+
+def _nudge_bump_by(wing: str, key: str, n: int) -> int:
+    """Thin wrapper so tests can monkeypatch."""
+    try:
+        return nudge_state.bump_by(wing, key, n)
+    except Exception:
+        logger.warning(
+            "nudge bump_by failed (%s/%s, n=%s)", wing, key, n, exc_info=True
+        )
         return 0
 
 
@@ -1914,8 +1924,9 @@ def _record_post_turn_counters(
     if writes["skill"]:
         _nudge_reset(wing, "iters_since_skill")
     else:
-        for _ in range(max(0, int(tool_iter_count))):
-            _nudge_bump(wing, "iters_since_skill")
+        n = max(0, int(tool_iter_count))
+        if n > 0:
+            _nudge_bump_by(wing, "iters_since_skill", n)
     if is_user_turn:
         if writes["memory"]:
             _nudge_reset(wing, "turns_since_memory")
