@@ -6,7 +6,7 @@
 
 **Architecture:** New module `background_review.py` owns the non-streaming Ollama call + restricted toolset + structural-tag input wrapping + forced-JSON output parsing. New module `nudge_state.py` owns per-wing persistent counters with atomic writes. New module `decision_log.py` owns the JSONL append-only decision trail + counts sidecar + ring-buffer rotation. The chat handler in `app.py` (a) increments counters in the tool-iter and per-turn paths, (b) detects skill/memory writes from `_exec_tool_async` results to reset the right counter, and (c) spawns the fork via `asyncio.create_task(...)` after the user-visible stream ends — fire-and-forget, all exceptions swallowed at the task boundary. The foreground model also gets a one-line system instruction permitting in-turn skill self-patching (Hermes `prompt_builder.py:182` port) so it doesn't have to wait for the fork to fix something it already knows is wrong.
 
-**Tech Stack:** Python 3.9, FastAPI, httpx (existing async client), Pydantic v2, asyncio (existing), pytest + `fastapi.testclient.TestClient`, MemPalace (`save_memory`, `search_memories`).
+**Tech Stack:** Python 3.9, FastAPI, httpx (existing async client), Pydantic v2, asyncio (existing), pytest + `fastapi.testclient.TestClient`, MemPalace (`diary_write` / `tool_add_drawer`, `search_memories`). NOTE: the spec uses `save_memory` as a generic label; the actual chat-tool name in this codebase is `diary_write` — keep using `diary_write` in all code and tests.
 
 ---
 
@@ -522,7 +522,7 @@ def test_restricted_tools_are_the_allow_list():
     names = {t["function"]["name"] for t in br.restricted_tools()}
     assert names == {
         "skill_manage", "skill_view",
-        "save_memory", "memory_search", "conversation_search",
+        "diary_write", "memory_search", "conversation_search",
     }
 ```
 
@@ -636,7 +636,7 @@ def parse_review_output(raw: str) -> dict:
 # The fork model may PROPOSE under these tools; the trusted main process
 # performs the write via _exec_tool_async.
 _ALLOWED = ("skill_manage", "skill_view",
-            "save_memory", "memory_search", "conversation_search")
+            "diary_write", "memory_search", "conversation_search")
 
 
 def restricted_tools() -> list:
@@ -810,7 +810,7 @@ def _dispatch_action(decision: dict, wing: str, session_id):
     """Map a parsed decision -> (tool_name, args) for the privileged write.
 
     Returns None for decisions that require no tool call (noop, memory-only
-    where the model already had save_memory available, errored).
+    where the model already had diary_write available, errored).
     """
     d = (decision or {}).get("decision")
     if d == "patch" and decision.get("skill") and decision.get("old"):
@@ -926,7 +926,7 @@ def test_detect_writes_in_tool_results_matches_verified_shapes():
         [{"ok": True, "name": "deploy", "action": "patch"}]
     )
     assert r == {"skill": True, "memory": False}
-    # save_memory (tool_add_drawer success)
+    # diary_write (tool_add_drawer success)
     r = app_module._detect_writes_in_tool_results(
         [{"success": True, "drawer_id": "abc", "wing": "personal", "room": "general"}]
     )
@@ -1065,11 +1065,11 @@ def _detect_writes_in_tool_results(results: list) -> dict:
     """Inspect tool_result payloads to decide which nudge counter to reset.
 
     Verified against `_exec_tool`/`_exec_tool_async` (grep `if name == "skill_manage"`,
-    `if name == "save_memory"`):
+    `if name == "diary_write"`):
       * skill_manage(create|patch) -> {"ok": True, "name": ..., "action": "create"|"patch"}
         (archive/restore are HTTP-only via /api/skills/{name}/{action}, NOT chat
         tools, so they cannot appear here.)
-      * save_memory (tool_add_drawer) -> {"success": True, "drawer_id": ..., "wing": ..., "room": ...}
+      * diary_write (tool_add_drawer) -> {"success": True, "drawer_id": ..., "wing": ..., "room": ...}
     """
     skill_write = False
     memory_write = False
@@ -1480,7 +1480,7 @@ Add three fields after `skill_limit` (Plan 2):
                 logger.warning("review fork gate failed", exc_info=True)
 ```
 
-Note: `transcript` is already built upstream in the same `generate()` body (used by `save_memory` and `auto_extract`). If `transcript` isn't in scope at this line, grep `transcript = ` in `generate()` to locate the existing definition and ensure the spawn call lives after it.
+Note: `transcript` is already built upstream in the same `generate()` body (used by the diary write and `auto_extract`). If `transcript` isn't in scope at this line, grep `transcript = ` in `generate()` to locate the existing definition and ensure the spawn call lives after it.
 
 - [ ] **Step 4: Run — expect PASS (full suite, both orderings)**
 
@@ -1719,7 +1719,7 @@ git push -u origin feat/background-review-fork
 
 **Pre-flight verifications (run before Task 1):**
 - `grep -nA 8 'if name == "skill_manage"' app.py` — confirm the two return shapes used by `_detect_writes_in_tool_results` (Task 5): `{"ok": True, "name": ..., "action": "create"}` and `{"ok": True, "name": ..., "action": "patch"}`. If a future commit added `archive`/`restore` as chat-tool actions, expand the predicate accordingly.
-- `grep -nA 3 'def tool_add_drawer' mempalace-src/mempalace/mcp_server.py` — confirm `save_memory` returns `{"success": True, "drawer_id": ..., "wing": ..., "room": ...}`.
+- `grep -nA 3 'def tool_add_drawer' mempalace-src/mempalace/mcp_server.py` — confirm `diary_write` (wrapping `tool_add_drawer`) returns `{"success": True, "drawer_id": ..., "wing": ..., "room": ...}`.
 - `grep -n 'transcript = \|transcript:' app.py` — confirm `transcript` is currently only defined inside the `if req.save_to_memory and last_user and full_response.strip():` block (~line 2593). The Task 6 Step 3a hoist removes that latent NameError.
 
 **Placeholder scan:** No TBD/TODO/"add error handling". Every code step has complete code; every test step has real assertions and exact commands + expected output. The two `pass` placeholders in Task 6 Step 3a are deliberate no-op comments (kept so a maintainer doesn't reintroduce a double-count) — not implementation placeholders.
