@@ -913,6 +913,41 @@ This task only WIRES the counters; the fork spawn lands in Task 7. Splitting the
 - [ ] **Step 1: Write the failing test — APPEND to `tests/test_app_skills_endpoints.py`**
 
 ```python
+def test_detect_writes_in_tool_results_matches_verified_shapes():
+    """Lock the predicate to the actual return shapes from app._exec_tool*."""
+    import app as app_module
+    # skill_manage create
+    r = app_module._detect_writes_in_tool_results(
+        [{"ok": True, "name": "deploy", "action": "create"}]
+    )
+    assert r == {"skill": True, "memory": False}
+    # skill_manage patch
+    r = app_module._detect_writes_in_tool_results(
+        [{"ok": True, "name": "deploy", "action": "patch"}]
+    )
+    assert r == {"skill": True, "memory": False}
+    # save_memory (tool_add_drawer success)
+    r = app_module._detect_writes_in_tool_results(
+        [{"success": True, "drawer_id": "abc", "wing": "personal", "room": "general"}]
+    )
+    assert r == {"skill": False, "memory": True}
+    # memory_search (non-write — must not flip either)
+    r = app_module._detect_writes_in_tool_results(
+        [{"results": [{"text": "..."}, {"text": "..."}]}]
+    )
+    assert r == {"skill": False, "memory": False}
+    # error-shaped result (skill_manage failure path)
+    r = app_module._detect_writes_in_tool_results([{"error": "bad name"}])
+    assert r == {"skill": False, "memory": False}
+    # mixed batch
+    r = app_module._detect_writes_in_tool_results([
+        {"ok": True, "name": "x", "action": "create"},
+        {"success": True, "drawer_id": "d1"},
+        {"error": "nope"},
+    ])
+    assert r == {"skill": True, "memory": True}
+
+
 def test_tool_iter_increments_iters_since_skill(monkeypatch, client):
     import nudge_state
     import app as app_module
@@ -1027,17 +1062,22 @@ def _should_count_skill_iter(combined_tools: list) -> bool:
 
 
 def _detect_writes_in_tool_results(results: list) -> dict:
-    """Inspect tool_result payloads to decide which nudge counter to reset."""
+    """Inspect tool_result payloads to decide which nudge counter to reset.
+
+    Verified against `_exec_tool`/`_exec_tool_async` (grep `if name == "skill_manage"`,
+    `if name == "save_memory"`):
+      * skill_manage(create|patch) -> {"ok": True, "name": ..., "action": "create"|"patch"}
+        (archive/restore are HTTP-only via /api/skills/{name}/{action}, NOT chat
+        tools, so they cannot appear here.)
+      * save_memory (tool_add_drawer) -> {"success": True, "drawer_id": ..., "wing": ..., "room": ...}
+    """
     skill_write = False
     memory_write = False
     for r in results or []:
         if not isinstance(r, dict):
             continue
-        # skill_manage create/patch/restore/archive all return action+name
-        action = r.get("action")
-        if r.get("ok") and action in ("create", "patch", "restore"):
+        if r.get("ok") and r.get("action") in ("create", "patch"):
             skill_write = True
-        # save_memory returns {"success": True, "drawer_id": ...}
         if r.get("success") and r.get("drawer_id"):
             memory_write = True
     return {"skill": skill_write, "memory": memory_write}
@@ -1143,38 +1183,57 @@ def test_chat_post_turn_invokes_record_counters(monkeypatch, client):
 Run: `.venv/bin/python -m pytest tests/test_app_skills_endpoints.py::test_chat_post_turn_invokes_record_counters -q`
 Expected: FAIL — recorder never called.
 
-- [ ] **Step 3a: Collect tool results in the tool loop — in `app.py`, at the top of the `if req.enable_tools:` branch (grep `for _ in range(MAX_TOOL_ITERATIONS)`), BEFORE the `for _ in range(MAX_TOOL_ITERATIONS):` line**
+- [ ] **Step 3a: Hoist the post-turn locals at the top of `generate()`**
+
+Find the start of the `async def generate()` body (grep `    async def generate`). Walk down a few lines until you find the line that defines `wing` (grep `^            wing = ` for the unique indentation). IMMEDIATELY AFTER that `wing = ...` line — but BEFORE any other use — paste the four-line hoist below. This guarantees the spawn call in Task 7 (and the recorder call in Step 3c) can reference these names whether or not the tool branch executed and whether or not `save_to_memory` was true.
 
 ```python
-                    tool_results_collected: list = []
-                    tool_iters: int = 0
+            tool_iters: int = 0
+            tool_results_collected: list = []
+            combined_tools: list = []
+            transcript: str = ""
 ```
 
-In the same block, inside `for tc in tool_calls:` (grep `for tc in tool_calls:`), AFTER the `result = await _exec_tool_async(...)` line and BEFORE the `yield ... type: tool_result`, append the result for later inspection:
+- [ ] **Step 3b: Capture each tool result + count the iteration**
+
+There are TWO insertion points inside the existing `if req.enable_tools:` branch. Both are identified by unique surrounding-context strings — do NOT rely on line numbers.
+
+**Insertion B1.** Find the unique string `result = await _exec_tool_async(` inside the `for tc in tool_calls:` loop. The line immediately after the closing `)` of that call must become:
 
 ```python
                             tool_results_collected.append(result)
 ```
 
-After the existing `current.append({"role": "tool", ...})` line inside the same for-loop, do NOT change anything else.
-
-Just BEFORE the outer `break` in the `if not tool_calls:` branch (the place where `full_response = assistant_text` is set), increment the iter count once for the completed loop turn:
+Existing context to confirm placement:
 
 ```python
-                            # break path: this iteration produced no tool calls
-                            # — it was the model's final answer, do not count it.
-                            pass
+                            result = await _exec_tool_async(
+                                name, raw_args, wing, req.session_id
+                            )
+                            tool_results_collected.append(result)   # <-- NEW
+                            yield (
+                                "data: "
+                                + json.dumps(
+                                    {
+                                        "type": "tool_result",
 ```
 
-(No-op — the iter increment lives elsewhere; this comment is kept so the next maintainer doesn't add a double-count.)
-
-At the bottom of the `for tc in tool_calls:` (i.e. AFTER all tool_calls of one iter are processed), AT END of the surrounding `for _ in range(MAX_TOOL_ITERATIONS):` body, add:
+**Insertion B2.** Find the unique string `# Hit iteration cap` (the comment that precedes the `else:`-clause of the `for _ in range(MAX_TOOL_ITERATIONS):` loop — grep it in `app.py`). The `tool_iters += 1` line must be inserted as the LAST statement of the loop body — i.e. immediately BEFORE the `# Hit iteration cap` comment line at the same indent as `# Hit iteration cap`:
 
 ```python
                         tool_iters += 1
+                    else:
+                        # Hit iteration cap
+                        yield (
 ```
 
-- [ ] **Step 3b: Call the recorder at post-turn — in the `async def generate()` body, AFTER `if req.auto_kg:` block, BEFORE the final `yield ... "type": "done"`**
+After insertion the loop body's tail looks exactly like that. Do NOT add a `tool_iters += 1` anywhere inside the `if not tool_calls:` early-break branch — that branch represents the model's final non-tool turn, which must NOT count as a skill iteration.
+
+**Reassign `transcript` when save_to_memory builds it.** Find the unique string `if req.save_to_memory and last_user and full_response.strip():`. The next line currently is `transcript = (`. Leave it as a plain assignment — because Step 3a hoisted `transcript: str = ""` above this block, this becomes a reassignment that survives outside the `if`.
+
+- [ ] **Step 3c: Call the recorder at post-turn**
+
+Find the unique string `if req.auto_kg:` inside `generate()`. The `if req.auto_kg:` block ends with a `for t in triples:` loop that mutates `kg_added`. AFTER that loop's closing dedent (i.e. one blank line BELOW the `kg_added.append(t)` block, but BEFORE the `yield (` that begins the final `"type": "done"` event), paste:
 
 ```python
             try:
@@ -1186,24 +1245,42 @@ At the bottom of the `for tc in tool_calls:` (i.e. AFTER all tool_calls of one i
                         and _should_count_skill_iter(combined_tools)
                         else 0
                     ),
-                    tool_results=(tool_results_collected
-                                  if req.enable_tools else []),
+                    tool_results=(
+                        tool_results_collected if req.enable_tools else []
+                    ),
                     is_user_turn=True,
                 )
             except Exception:
-                logger.warning("post-turn counter recording failed",
-                               exc_info=True)
+                logger.warning(
+                    "post-turn counter recording failed", exc_info=True
+                )
 ```
 
-Note: `tool_iters`, `tool_results_collected`, and `combined_tools` are only defined inside the `if req.enable_tools:` branch. To make them safe to reference outside, hoist their defaults at the top of `generate()`:
+Existing context to confirm placement (the final `yield` should appear directly after this new block):
 
 ```python
-    tool_iters = 0
-    tool_results_collected: list = []
-    combined_tools: list = []
+                        if result.get("success"):
+                            kg_added.append(t)
+                    except Exception:
+                        continue
+
+        try:
+            _record_post_turn_counters(   # <-- NEW BLOCK BEGINS
+                ...
+            )
+        except Exception:
+            logger.warning(...)            # <-- NEW BLOCK ENDS
+
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "done",
 ```
 
-Place this hoist immediately after the `wing = ...` line near the top of `generate()` (grep `wing = `).
+- [ ] **Step 3d: Assign `combined_tools` to the hoisted name**
+
+Find the unique string `combined_tools = TOOLS + ext_tools + (` inside `if req.enable_tools:`. Because Step 3a already declared `combined_tools: list = []` at the top of `generate()`, this existing line is now a reassignment — DO NOT prepend a `nonlocal`/`global`; nothing about the existing line changes. This step exists only so the executor verifies the assignment is reachable from the outer scope (it is, because Python closures share the enclosing function's locals).
 
 - [ ] **Step 4: Run — expect PASS (full suite, both orderings)**
 
@@ -1634,8 +1711,16 @@ git push -u origin feat/background-review-fork
 - §2 Trigger gating (iters_since_skill, turns_since_memory, per-wing persistence, configurable intervals, 0-disables) → Tasks 1, 5–7, 9.
 - §4.1 Skill creation prompt + preference order + Do-NOT-capture list → Task 3 `SKILL_REVIEW_PROMPT`.
 - §4.2 Skill self-patching: review-fork dispatch → Task 4 `_dispatch_action`; foreground inline-patch hint → Task 8.
-- §11 defaults: reuse turn's model (Task 7 passes `req.model`); completed-turn transcript snapshot (Task 7 passes existing `transcript` var); free-form category with safe slug filter (already handled by Plan 1 `skill_store.slugify`).
+- §11 defaults: reuse turn's model (Task 7 passes `req.model`); completed-turn transcript snapshot (Task 6 Step 3a hoists `transcript: str = ""` at the top of `generate()` so the spawn call in Task 7 is safe even when `save_to_memory=False` or the user message was empty); free-form category with safe slug filter (already handled by Plan 1 `skill_store.slugify`).
 - §12 Plan 3 ideas: fail-improve JSONL + counts sidecar + cascade_failure flag + ring-buffer rotation → Task 2; privilege-separation allow-list → Task 3 `restricted_tools()` + Task 4 `_dispatch_action`; prompt hardening (structural tags + treat-as-data guard + forced-JSON + regex fallback) → Task 3.
+
+**Side-effects acknowledged:**
+- Task 8 updates `_format_skills_index`, which is also consumed by `/api/wakeup` (Plan 2 Task 5). The inline-patch hint will therefore appear in the wakeup preview text too. Intentional: the wakeup preview is the same audience (the model itself, on next turn), so the same guidance applies. If a future task ever needs differentiated wakeup vs chat blocks, split `_format_skills_index(limit, include_patch_hint)`.
+
+**Pre-flight verifications (run before Task 1):**
+- `grep -nA 8 'if name == "skill_manage"' app.py` — confirm the two return shapes used by `_detect_writes_in_tool_results` (Task 5): `{"ok": True, "name": ..., "action": "create"}` and `{"ok": True, "name": ..., "action": "patch"}`. If a future commit added `archive`/`restore` as chat-tool actions, expand the predicate accordingly.
+- `grep -nA 3 'def tool_add_drawer' mempalace-src/mempalace/mcp_server.py` — confirm `save_memory` returns `{"success": True, "drawer_id": ..., "wing": ..., "room": ...}`.
+- `grep -n 'transcript = \|transcript:' app.py` — confirm `transcript` is currently only defined inside the `if req.save_to_memory and last_user and full_response.strip():` block (~line 2593). The Task 6 Step 3a hoist removes that latent NameError.
 
 **Placeholder scan:** No TBD/TODO/"add error handling". Every code step has complete code; every test step has real assertions and exact commands + expected output. The two `pass` placeholders in Task 6 Step 3a are deliberate no-op comments (kept so a maintainer doesn't reintroduce a double-count) — not implementation placeholders.
 
