@@ -117,3 +117,108 @@ def test_wakeup_includes_skills_block(client):
     assert r.status_code == 200
     assert "<available_skills>" in r.json()["text"]
     assert "wk:" in r.json()["text"]
+
+
+def test_detect_writes_in_tool_results_matches_verified_shapes():
+    """Lock the predicate to the actual return shapes from app._exec_tool*."""
+    import app as app_module
+    # skill_manage create
+    r = app_module._detect_writes_in_tool_results(
+        [{"ok": True, "name": "deploy", "action": "create"}]
+    )
+    assert r == {"skill": True, "memory": False}
+    # skill_manage patch
+    r = app_module._detect_writes_in_tool_results(
+        [{"ok": True, "name": "deploy", "action": "patch"}]
+    )
+    assert r == {"skill": True, "memory": False}
+    # diary_write (tool_add_drawer success)
+    r = app_module._detect_writes_in_tool_results(
+        [{"success": True, "drawer_id": "abc", "wing": "personal", "room": "general"}]
+    )
+    assert r == {"skill": False, "memory": True}
+    # memory_search (non-write — must not flip either)
+    r = app_module._detect_writes_in_tool_results(
+        [{"results": [{"text": "..."}, {"text": "..."}]}]
+    )
+    assert r == {"skill": False, "memory": False}
+    # error-shaped result (skill_manage failure path)
+    r = app_module._detect_writes_in_tool_results([{"error": "bad name"}])
+    assert r == {"skill": False, "memory": False}
+    # mixed batch
+    r = app_module._detect_writes_in_tool_results([
+        {"ok": True, "name": "x", "action": "create"},
+        {"success": True, "drawer_id": "d1"},
+        {"error": "nope"},
+    ])
+    assert r == {"skill": True, "memory": True}
+
+
+def test_tool_iter_increments_iters_since_skill(monkeypatch, client):
+    import nudge_state
+    import app as app_module
+
+    state = []
+    monkeypatch.setattr(app_module, "_nudge_bump",
+                        lambda wing, key: state.append((wing, key)))
+    monkeypatch.setattr(app_module, "_nudge_reset",
+                        lambda wing, key: state.append(("reset", wing, key)))
+    monkeypatch.setattr(app_module, "_should_count_skill_iter",
+                        lambda combined_tools: True)
+    monkeypatch.setattr(app_module, "_detect_writes_in_tool_results",
+                        lambda results: {"skill": False, "memory": False})
+
+    app_module._record_post_turn_counters(
+        wing="personal",
+        tool_iter_count=2,
+        tool_results=[{"ok": True, "name": "foo", "action": "patch"}],
+        is_user_turn=True,
+    )
+    assert ("personal", "iters_since_skill") in state
+    assert ("personal", "turns_since_memory") in state
+    assert not any(s[0] == "reset" for s in state)
+
+
+def test_skill_write_resets_iters_counter(monkeypatch, client):
+    import app as app_module
+    state = []
+    monkeypatch.setattr(app_module, "_nudge_bump",
+                        lambda wing, key: state.append(("bump", wing, key)))
+    monkeypatch.setattr(app_module, "_nudge_reset",
+                        lambda wing, key: state.append(("reset", wing, key)))
+    monkeypatch.setattr(app_module, "_should_count_skill_iter",
+                        lambda combined_tools: True)
+    monkeypatch.setattr(
+        app_module, "_detect_writes_in_tool_results",
+        lambda results: {"skill": True, "memory": False},
+    )
+
+    app_module._record_post_turn_counters(
+        wing="personal",
+        tool_iter_count=1,
+        tool_results=[{"ok": True, "name": "deploy", "action": "create"}],
+        is_user_turn=True,
+    )
+    assert ("reset", "personal", "iters_since_skill") in state
+    assert ("bump", "personal", "turns_since_memory") in state
+
+
+def test_memory_write_resets_turns_counter(monkeypatch, client):
+    import app as app_module
+    state = []
+    monkeypatch.setattr(app_module, "_nudge_bump",
+                        lambda wing, key: state.append(("bump", wing, key)))
+    monkeypatch.setattr(app_module, "_nudge_reset",
+                        lambda wing, key: state.append(("reset", wing, key)))
+    monkeypatch.setattr(app_module, "_should_count_skill_iter",
+                        lambda combined_tools: True)
+    monkeypatch.setattr(
+        app_module, "_detect_writes_in_tool_results",
+        lambda results: {"skill": False, "memory": True},
+    )
+
+    app_module._record_post_turn_counters(
+        wing="personal", tool_iter_count=0,
+        tool_results=[], is_user_turn=True,
+    )
+    assert ("reset", "personal", "turns_since_memory") in state

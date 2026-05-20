@@ -1845,6 +1845,84 @@ TOOLS = [
     },
 ]
 
+
+# ─── Nudge counters (Plan 3 background-review fork triggers) ────────────────
+
+import nudge_state  # noqa: E402
+
+
+def _nudge_bump(wing: str, key: str) -> int:
+    """Thin wrapper so tests can monkeypatch."""
+    try:
+        return nudge_state.bump(wing, key)
+    except Exception:
+        logger.warning("nudge bump failed (%s/%s)", wing, key, exc_info=True)
+        return 0
+
+
+def _nudge_reset(wing: str, key: str) -> None:
+    """Thin wrapper so tests can monkeypatch."""
+    try:
+        nudge_state.reset(wing, key)
+    except Exception:
+        logger.warning("nudge reset failed (%s/%s)", wing, key, exc_info=True)
+
+
+def _should_count_skill_iter(combined_tools: list) -> bool:
+    """Only count tool-iters when skill_manage is in the offered toolset."""
+    return any(
+        (t.get("function") or {}).get("name") == "skill_manage"
+        for t in combined_tools or []
+    )
+
+
+def _detect_writes_in_tool_results(results: list) -> dict:
+    """Inspect tool_result payloads to decide which nudge counter to reset.
+
+    Verified against `_exec_tool`/`_exec_tool_async` (grep `if name == "skill_manage"`,
+    `if name == "diary_write"`):
+      * skill_manage(create|patch) -> {"ok": True, "name": ..., "action": "create"|"patch"}
+        (archive/restore are HTTP-only via /api/skills/{name}/{action}, NOT chat
+        tools, so they cannot appear here.)
+      * diary_write (tool_add_drawer) -> {"success": True, "drawer_id": ..., "wing": ..., "room": ...}
+    """
+    skill_write = False
+    memory_write = False
+    for r in results or []:
+        if not isinstance(r, dict):
+            continue
+        if r.get("ok") and r.get("action") in ("create", "patch"):
+            skill_write = True
+        if r.get("success") and r.get("drawer_id"):
+            memory_write = True
+    return {"skill": skill_write, "memory": memory_write}
+
+
+def _record_post_turn_counters(
+    *,
+    wing: str,
+    tool_iter_count: int,
+    tool_results: list,
+    is_user_turn: bool,
+) -> None:
+    """Update nudge counters after a chat turn completes.
+
+    Caller is responsible for filtering tool_iter_count by _should_count_skill_iter
+    (i.e. pass 0 when skill_manage wasn't offered).
+    """
+    writes = _detect_writes_in_tool_results(tool_results)
+    if writes["skill"]:
+        _nudge_reset(wing, "iters_since_skill")
+    else:
+        for _ in range(max(0, int(tool_iter_count))):
+            _nudge_bump(wing, "iters_since_skill")
+    if is_user_turn:
+        if writes["memory"]:
+            _nudge_reset(wing, "turns_since_memory")
+        else:
+            _nudge_bump(wing, "turns_since_memory")
+
+
 TOOL_PROTOCOL = (
     "You have tools available. Use them proactively:\n"
     "- BEFORE answering about the user's past (preferences, people, projects, "
