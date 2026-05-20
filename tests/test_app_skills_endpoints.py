@@ -275,3 +275,83 @@ def test_chat_post_turn_invokes_record_counters(monkeypatch, client):
     assert recorded, "expected post-turn counter recording"
     assert recorded[0]["wing"]
     assert recorded[0]["is_user_turn"] is True
+
+
+def test_fork_fires_when_iters_threshold_tripped(monkeypatch):
+    import app as app_module
+
+    monkeypatch.setattr(app_module, "_nudge_load",
+                        lambda wing: {"iters_since_skill": 15,
+                                      "turns_since_memory": 0})
+    spawned = []
+    monkeypatch.setattr(
+        app_module, "_spawn_review_fork",
+        lambda **kw: spawned.append(kw),
+    )
+
+    app_module._maybe_spawn_fork(
+        wing="personal",
+        model="m",
+        transcript="t",
+        loaded_skills=[],
+        session_id=None,
+        creation_nudge_interval=15,
+        memory_nudge_interval=10,
+        review_enabled=True,
+    )
+    assert len(spawned) == 1
+    assert spawned[0]["wing"] == "personal"
+
+
+def test_fork_does_not_fire_when_disabled(monkeypatch):
+    import app as app_module
+    monkeypatch.setattr(app_module, "_nudge_load",
+                        lambda wing: {"iters_since_skill": 999,
+                                      "turns_since_memory": 999})
+    spawned = []
+    monkeypatch.setattr(app_module, "_spawn_review_fork",
+                        lambda **kw: spawned.append(kw))
+    app_module._maybe_spawn_fork(
+        wing="personal", model="m", transcript="t", loaded_skills=[],
+        session_id=None,
+        creation_nudge_interval=0,
+        memory_nudge_interval=0,
+        review_enabled=True,
+    )
+    assert spawned == []
+
+
+def test_fork_fires_once_when_both_nudges_trip(monkeypatch):
+    """Combined-fork: both counters over threshold => exactly one spawn."""
+    import app as app_module
+    monkeypatch.setattr(app_module, "_nudge_load",
+                        lambda wing: {"iters_since_skill": 20,
+                                      "turns_since_memory": 12})
+    spawned = []
+    monkeypatch.setattr(app_module, "_spawn_review_fork",
+                        lambda **kw: spawned.append(kw))
+    app_module._maybe_spawn_fork(
+        wing="personal", model="m", transcript="t", loaded_skills=[],
+        session_id=None,
+        creation_nudge_interval=15, memory_nudge_interval=10,
+        review_enabled=True,
+    )
+    assert len(spawned) == 1
+
+
+def test_fork_does_not_fire_when_review_enabled_false(monkeypatch):
+    """Per-request review_enabled=False overrides threshold."""
+    import app as app_module
+    monkeypatch.setattr(app_module, "_nudge_load",
+                        lambda wing: {"iters_since_skill": 999,
+                                      "turns_since_memory": 999})
+    spawned = []
+    monkeypatch.setattr(app_module, "_spawn_review_fork",
+                        lambda **kw: spawned.append(kw))
+    app_module._maybe_spawn_fork(
+        wing="personal", model="m", transcript="t", loaded_skills=[],
+        session_id=None,
+        creation_nudge_interval=15, memory_nudge_interval=10,
+        review_enabled=False,
+    )
+    assert spawned == []

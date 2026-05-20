@@ -112,6 +112,9 @@ class ChatRequest(BaseModel):
     memory_limit: int = Field(default=5, ge=1, le=20)
     use_skills: bool = True
     skill_limit: int = Field(default=15, ge=1, le=50)
+    review_fork: bool = True
+    creation_nudge_interval: int = Field(default=15, ge=0, le=200)
+    memory_nudge_interval: int = Field(default=10, ge=0, le=200)
     persona: Optional[str] = None
     # Context window handling. When True, the server auto-summarizes older
     # message pairs before sending if the prompt would exceed
@@ -1934,6 +1937,66 @@ def _record_post_turn_counters(
             _nudge_bump(wing, "turns_since_memory")
 
 
+def _nudge_load(wing: str) -> dict:
+    """Thin wrapper so tests can monkeypatch."""
+    try:
+        return nudge_state.load(wing)
+    except Exception:
+        return {"iters_since_skill": 0, "turns_since_memory": 0}
+
+
+def _spawn_review_fork(*, model: str, transcript: str, wing: str,
+                       loaded_skills: list, session_id) -> None:
+    """Fire-and-forget background task; all exceptions swallowed."""
+    import background_review
+
+    async def _runner():
+        try:
+            await background_review.run_skill_review(
+                model=model, transcript=transcript, wing=wing,
+                loaded_skills=loaded_skills, session_id=session_id,
+            )
+        except Exception:
+            logger.warning("review fork errored", exc_info=True)
+
+    try:
+        asyncio.create_task(_runner())
+    except RuntimeError:
+        # No running loop (e.g. import-time call) — silently skip.
+        pass
+
+
+def _maybe_spawn_fork(
+    *,
+    wing: str,
+    model: str,
+    transcript: str,
+    loaded_skills: list,
+    session_id,
+    creation_nudge_interval: int,
+    memory_nudge_interval: int,
+    review_enabled: bool,
+) -> None:
+    """Threshold-check + at-most-one-spawn-per-turn gate."""
+    if not review_enabled:
+        return
+    counters = _nudge_load(wing)
+    skill_trip = (
+        creation_nudge_interval > 0
+        and counters.get("iters_since_skill", 0) >= creation_nudge_interval
+    )
+    memory_trip = (
+        memory_nudge_interval > 0
+        and counters.get("turns_since_memory", 0) >= memory_nudge_interval
+    )
+    if not (skill_trip or memory_trip):
+        return
+    _spawn_review_fork(
+        model=model, transcript=transcript, wing=wing,
+        loaded_skills=loaded_skills, session_id=session_id,
+    )
+
+
 TOOL_PROTOCOL = (
     "You have tools available. Use them proactively:\n"
     "- BEFORE answering about the user's past (preferences, people, projects, "
@@ -2746,6 +2809,31 @@ async def chat(req: ChatRequest):
             logger.warning(
                 "post-turn counter recording failed", exc_info=True
             )
+
+        try:
+            loaded_skill_names: list = []
+            if req.use_skills:
+                try:
+                    loaded_skill_names = [
+                        s["name"]
+                        for s in skill_store.list_skills(include_archived=False)[
+                            : req.skill_limit
+                        ]
+                    ]
+                except Exception:
+                    loaded_skill_names = []
+            _maybe_spawn_fork(
+                wing=wing,
+                model=req.model,
+                transcript=transcript,
+                loaded_skills=loaded_skill_names,
+                session_id=req.session_id,
+                creation_nudge_interval=req.creation_nudge_interval,
+                memory_nudge_interval=req.memory_nudge_interval,
+                review_enabled=req.review_fork,
+            )
+        except Exception:
+            logger.warning("review fork gate failed", exc_info=True)
 
         yield (
             "data: "
