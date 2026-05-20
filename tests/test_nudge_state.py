@@ -61,3 +61,5 @@ def test_atomic_write_does_not_corrupt_on_partial_failure(monkeypatch, tmp_path)
         ns.bump(wing="personal", key="iters_since_skill")
     # Original file unchanged
     assert json.loads(ns.STATE_PATH.read_text()) == good
+    # Tempfile from the failed write was cleaned up
+    assert not any(tmp_path.glob(".nudge.*.tmp"))

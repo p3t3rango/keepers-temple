@@ -10,9 +10,12 @@ Reset by the chat handler when it detects the corresponding write in a turn.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 STATE_PATH = Path(os.path.expanduser("~/.mempalace/skills/.nudge_state.json"))
 _VALID_KEYS = ("iters_since_skill", "turns_since_memory")
@@ -25,6 +28,10 @@ def _load_all() -> dict:
         return {}
     except Exception:
         # Corrupt file is treated as empty; never propagate to the chat path.
+        logger.warning(
+            "nudge_state: corrupt JSON at %s, resetting", STATE_PATH,
+            exc_info=True,
+        )
         return {}
 
 
@@ -53,7 +60,11 @@ def load(wing: str) -> dict:
 
 
 def bump(wing: str, key: str) -> int:
-    """Increment one counter for one wing; returns the new value."""
+    """Increment one counter for one wing; returns the new value.
+
+    Single-writer assumption: the chat handler calls bump/reset sequentially.
+    Concurrent callers would race read-modify-write (bounded lost-update).
+    """
     if key not in _VALID_KEYS:
         raise ValueError(f"unknown nudge counter: {key!r}")
     state = _load_all()
