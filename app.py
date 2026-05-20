@@ -2459,9 +2459,12 @@ async def chat(req: ChatRequest):
     out_messages.extend(chat_msgs)
 
     async def generate():
+        # Hoisted for the post-turn counter recorder (Task 6) and the
+        # background-review fork spawn (Task 7) — must survive both the
+        # `enable_tools` branch and the `save_to_memory` branch.
         tool_iters: int = 0
-        tool_results_collected: list = []
-        combined_tools: list = []
+        tool_results_collected: list[dict] = []
+        combined_tools: list[dict] = []
         transcript: str = ""
         meta = {
             "type": "memory_hits",

@@ -252,9 +252,6 @@ def test_chat_post_turn_invokes_record_counters(monkeypatch, client):
             for line in self.lines:
                 yield line.decode()
 
-        async def aread(self):
-            return b""
-
     class _Ctx:
         async def __aenter__(self): return _FakeStream()
         async def __aexit__(self, *a): return False
