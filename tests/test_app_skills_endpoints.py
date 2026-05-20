@@ -229,3 +229,52 @@ def test_memory_write_resets_turns_counter(monkeypatch):
         tool_results=[], is_user_turn=True,
     )
     assert ("reset", "personal", "turns_since_memory") in state
+
+
+def test_chat_post_turn_invokes_record_counters(monkeypatch, client):
+    """Smoke: a non-streaming chat turn (enable_tools=False, so no Ollama
+    tool loop) still records counters when it completes."""
+    import app as app_module
+
+    recorded = []
+    monkeypatch.setattr(
+        app_module, "_record_post_turn_counters",
+        lambda **kw: recorded.append(kw),
+    )
+
+    class _FakeStream:
+        status_code = 200
+
+        def __init__(self):
+            self.lines = [b'{"message":{"content":"hi"},"done":true}']
+
+        async def aiter_lines(self):
+            for line in self.lines:
+                yield line.decode()
+
+        async def aread(self):
+            return b""
+
+    class _Ctx:
+        async def __aenter__(self): return _FakeStream()
+        async def __aexit__(self, *a): return False
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+
+        def stream(self, *a, **kw): return _Ctx()
+
+    monkeypatch.setattr(app_module.httpx, "AsyncClient", lambda *a, **k: _FakeClient())
+
+    r = client.post("/api/chat", json={
+        "model": "m", "enable_tools": False,
+        "messages": [{"role": "user", "content": "hi"}],
+        "use_memory": False, "use_identity": False, "use_skills": False,
+        "auto_extract": False, "auto_kg": False,
+    })
+    assert r.status_code == 200
+    list(r.iter_lines())  # drain SSE
+    assert recorded, "expected post-turn counter recording"
+    assert recorded[0]["wing"]
+    assert recorded[0]["is_user_turn"] is True

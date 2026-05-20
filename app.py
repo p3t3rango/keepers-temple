@@ -2459,6 +2459,10 @@ async def chat(req: ChatRequest):
     out_messages.extend(chat_msgs)
 
     async def generate():
+        tool_iters: int = 0
+        tool_results_collected: list = []
+        combined_tools: list = []
+        transcript: str = ""
         meta = {
             "type": "memory_hits",
             "wing": wing,
@@ -2572,6 +2576,7 @@ async def chat(req: ChatRequest):
                             result = await _exec_tool_async(
                                 name, raw_args, wing, req.session_id
                             )
+                            tool_results_collected.append(result)
                             yield (
                                 "data: "
                                 + json.dumps(
@@ -2590,6 +2595,7 @@ async def chat(req: ChatRequest):
                                     "content": json.dumps(result),
                                 }
                             )
+                        tool_iters += 1
                     else:
                         # Hit iteration cap
                         yield (
@@ -2718,6 +2724,25 @@ async def chat(req: ChatRequest):
                             kg_added.append(t)
                     except Exception:
                         continue
+
+        try:
+            _record_post_turn_counters(
+                wing=wing,
+                tool_iter_count=(
+                    tool_iters
+                    if req.enable_tools
+                    and _should_count_skill_iter(combined_tools)
+                    else 0
+                ),
+                tool_results=(
+                    tool_results_collected if req.enable_tools else []
+                ),
+                is_user_turn=True,
+            )
+        except Exception:
+            logger.warning(
+                "post-turn counter recording failed", exc_info=True
+            )
 
         yield (
             "data: "
