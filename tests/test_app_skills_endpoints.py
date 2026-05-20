@@ -303,7 +303,7 @@ def test_fork_fires_when_iters_threshold_tripped(monkeypatch):
     assert spawned[0]["wing"] == "personal"
 
 
-def test_fork_does_not_fire_when_disabled(monkeypatch):
+def test_fork_does_not_fire_when_both_intervals_zero(monkeypatch):
     import app as app_module
     monkeypatch.setattr(app_module, "_nudge_load",
                         lambda wing: {"iters_since_skill": 999,

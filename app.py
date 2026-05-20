@@ -1959,10 +1959,15 @@ def _spawn_review_fork(*, model: str, transcript: str, wing: str,
         except Exception:
             logger.warning("review fork errored", exc_info=True)
 
+    # Fire-and-forget: CPython holds the task alive via the event-loop registry
+    # for the duration of the running loop, so no strong-reference set is needed
+    # here. The RuntimeError catch is specifically for "no running event loop"
+    # at import-time / synchronous test contexts; other RuntimeErrors (e.g.
+    # cross-loop attachment) would indicate a real bug and should propagate —
+    # but in fire-and-forget, we accept silent skip as the safer default.
     try:
         asyncio.create_task(_runner())
     except RuntimeError:
-        # No running loop (e.g. import-time call) — silently skip.
         pass
 
 
@@ -2811,7 +2816,7 @@ async def chat(req: ChatRequest):
             )
 
         try:
-            loaded_skill_names: list = []
+            loaded_skill_names: list[str] = []
             if req.use_skills:
                 try:
                     loaded_skill_names = [
