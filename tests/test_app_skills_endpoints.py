@@ -355,3 +355,30 @@ def test_fork_does_not_fire_when_review_enabled_false(monkeypatch):
         review_enabled=False,
     )
     assert spawned == []
+
+
+def test_env_disables_review_fork_globally(monkeypatch):
+    import app as app_module
+    monkeypatch.setenv("KT_REVIEW_FORK", "0")
+    monkeypatch.setattr(app_module, "_nudge_load",
+                        lambda wing: {"iters_since_skill": 999,
+                                      "turns_since_memory": 999})
+    spawned = []
+    monkeypatch.setattr(app_module, "_spawn_review_fork",
+                        lambda **kw: spawned.append(kw))
+    # Per-request review_fork=True but env override should win.
+    app_module._maybe_spawn_fork(
+        wing="personal", model="m", transcript="t", loaded_skills=[],
+        session_id=None,
+        creation_nudge_interval=15, memory_nudge_interval=10,
+        review_enabled=app_module._review_enabled_for_request(True),
+    )
+    assert spawned == []
+
+
+def test_env_default_intervals_used_when_request_omits(monkeypatch):
+    import app as app_module
+    monkeypatch.setenv("KT_CREATION_NUDGE_INTERVAL", "5")
+    monkeypatch.setenv("KT_MEMORY_NUDGE_INTERVAL", "3")
+    assert app_module._default_creation_nudge_interval() == 5
+    assert app_module._default_memory_nudge_interval() == 3

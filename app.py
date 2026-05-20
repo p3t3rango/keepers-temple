@@ -2002,6 +2002,27 @@ def _maybe_spawn_fork(
     )
 
 
+def _review_enabled_for_request(per_request: bool) -> bool:
+    """Env override beats per-request opt-in (operator kill switch)."""
+    if os.environ.get("KT_REVIEW_FORK", "1").strip() in ("0", "false", "False"):
+        return False
+    return bool(per_request)
+
+
+def _default_creation_nudge_interval() -> int:
+    try:
+        return max(0, int(os.environ.get("KT_CREATION_NUDGE_INTERVAL", "15")))
+    except ValueError:
+        return 15
+
+
+def _default_memory_nudge_interval() -> int:
+    try:
+        return max(0, int(os.environ.get("KT_MEMORY_NUDGE_INTERVAL", "10")))
+    except ValueError:
+        return 10
+
+
 TOOL_PROTOCOL = (
     "You have tools available. Use them proactively:\n"
     "- BEFORE answering about the user's past (preferences, people, projects, "
@@ -2838,7 +2859,7 @@ async def chat(req: ChatRequest):
                 session_id=req.session_id,
                 creation_nudge_interval=req.creation_nudge_interval,
                 memory_nudge_interval=req.memory_nudge_interval,
-                review_enabled=req.review_fork,
+                review_enabled=_review_enabled_for_request(req.review_fork),
             )
         except Exception:
             logger.warning("review fork gate failed", exc_info=True)
