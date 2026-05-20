@@ -117,3 +117,123 @@ def restricted_tools() -> list:
         t for t in app.TOOLS
         if (t.get("function") or {}).get("name") in _ALLOWED
     ]
+
+
+import logging
+import os
+from datetime import datetime, timezone
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+REVIEW_TIMEOUT_SECONDS = float(os.environ.get("KT_REVIEW_TIMEOUT", "120"))
+
+
+async def _ollama_chat(model: str, messages: list, tools: list) -> httpx.Response:
+    """Non-streaming Ollama call. Module-level so tests can monkeypatch it."""
+    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    async with httpx.AsyncClient(timeout=REVIEW_TIMEOUT_SECONDS) as client:
+        return await client.post(
+            f"{host}/api/chat",
+            json={
+                "model": model,
+                "messages": messages,
+                "tools": tools,
+                "stream": False,
+            },
+        )
+
+
+async def _exec_tool_async(name: str, args: dict, wing: str, session_id):
+    """Module-level shim so tests can monkeypatch the privileged write seam."""
+    import app  # noqa: WPS433
+    return await app._exec_tool_async(name, args, wing, session_id)
+
+
+def _log_decision(rec: dict) -> None:
+    """Module-level shim so tests can monkeypatch the log seam."""
+    import decision_log  # noqa: WPS433
+    decision_log.append(rec)
+
+
+def _dispatch_action(decision: dict, wing: str, session_id):
+    """Map a parsed decision -> (tool_name, args) for the privileged write.
+
+    Returns None for decisions that require no tool call (noop, memory-only
+    where the model already had diary_write available, errored).
+    """
+    d = (decision or {}).get("decision")
+    if d == "patch" and decision.get("skill") and decision.get("old"):
+        return ("skill_manage", {
+            "action": "patch",
+            "name": decision["skill"],
+            "old_string": decision.get("old"),
+            "new_string": decision.get("new") or "",
+        })
+    if d == "create" and decision.get("name") and decision.get("description"):
+        return ("skill_manage", {
+            "action": "create",
+            "name": decision["name"],
+            "description": decision["description"],
+            "body": decision.get("body") or "## Contract\n(stub)\n",
+        })
+    return None
+
+
+async def run_skill_review(
+    *,
+    model: str,
+    transcript: str,
+    wing: str,
+    loaded_skills: list,
+    session_id,
+) -> dict:
+    """Run one review-fork turn. Always returns a decision dict; never raises."""
+    ts = datetime.now(timezone.utc).isoformat()
+    base_record = {
+        "ts": ts, "wing": wing, "model": model,
+        "trigger": "skill_review",
+        "input_truncated": transcript,
+        "loaded_skills": list(loaded_skills or []),
+    }
+    try:
+        wrapped = wrap_input(transcript, wing, loaded_skills)
+        messages = [
+            {"role": "system", "content": SKILL_REVIEW_PROMPT},
+            {"role": "user", "content": wrapped},
+        ]
+        try:
+            tools = restricted_tools()
+        except Exception:
+            tools = []
+        r = await _ollama_chat(model, messages, tools)
+        if r.status_code != 200:
+            raise RuntimeError(f"ollama {r.status_code}")
+        raw = ((r.json() or {}).get("message") or {}).get("content") or ""
+        decision = parse_review_output(raw)
+        dispatch = _dispatch_action(decision, wing, session_id)
+        if dispatch is not None:
+            try:
+                await _exec_tool_async(dispatch[0], dispatch[1], wing, session_id)
+            except Exception:
+                logger.warning(
+                    "review fork dispatch failed for %r", dispatch[0],
+                    exc_info=True,
+                )
+        _log_decision({
+            **base_record,
+            "raw_review_output": raw,
+            "decision": decision.get("decision", "noop"),
+            "decision_payload": decision,
+        })
+        return decision
+    except Exception as e:
+        logger.warning("review fork failed", exc_info=True)
+        _log_decision({
+            **base_record,
+            "decision": "errored",
+            "cascade_failure": True,
+            "error": str(e),
+        })
+        return {"decision": "errored", "error": str(e)}

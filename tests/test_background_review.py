@@ -83,3 +83,91 @@ def test_restricted_tools_are_the_allow_list():
         "skill_manage", "skill_view",
         "diary_write", "memory_search", "conversation_search",
     }
+
+
+import asyncio
+
+
+def test_run_skill_review_dispatches_returned_tool_call(monkeypatch):
+    # Fake the Ollama call to return a single patch tool_call decision.
+    async def fake_post(*a, **k):
+        class _R:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "message": {
+                        "content": (
+                            '{"decision": "patch", "skill": "deploy", '
+                            '"old": "foo", "new": "bar", "reason": "stale"}'
+                        )
+                    }
+                }
+        return _R()
+
+    monkeypatch.setattr(br, "_ollama_chat", fake_post)
+
+    calls = []
+
+    async def fake_exec(name, args, wing, session_id):
+        calls.append((name, args, wing))
+        return {"ok": True, "action": "patch", "name": "deploy"}
+
+    monkeypatch.setattr(br, "_exec_tool_async", fake_exec)
+
+    decision = asyncio.run(
+        br.run_skill_review(
+            model="m", transcript="t", wing="personal",
+            loaded_skills=["deploy"], session_id=None,
+        )
+    )
+    assert decision["decision"] == "patch"
+    assert calls and calls[0][0] == "skill_manage"
+    # privilege-separation: only skill_manage is dispatched (proposal->write)
+    assert calls[0][1]["action"] == "patch"
+    assert calls[0][1]["name"] == "deploy"
+
+
+def test_run_skill_review_swallows_errors_and_logs_cascade_failure(monkeypatch):
+    async def boom(*a, **k):
+        raise RuntimeError("ollama down")
+    monkeypatch.setattr(br, "_ollama_chat", boom)
+
+    logged = []
+    monkeypatch.setattr(br, "_log_decision",
+                        lambda rec: logged.append(rec))
+
+    decision = asyncio.run(
+        br.run_skill_review(
+            model="m", transcript="t", wing="personal",
+            loaded_skills=[], session_id=None,
+        )
+    )
+    assert decision["decision"] == "errored"
+    assert logged and logged[0]["cascade_failure"] is True
+
+
+def test_run_skill_review_noop_when_decision_is_noop(monkeypatch):
+    async def fake_post(*a, **k):
+        class _R:
+            status_code = 200
+
+            def json(self):
+                return {"message": {"content": '{"decision": "noop"}'}}
+        return _R()
+    monkeypatch.setattr(br, "_ollama_chat", fake_post)
+    calls = []
+
+    async def fake_exec(*a, **k):
+        calls.append(a)
+        return {}
+    monkeypatch.setattr(br, "_exec_tool_async", fake_exec)
+
+    decision = asyncio.run(
+        br.run_skill_review(
+            model="m", transcript="t", wing="personal",
+            loaded_skills=[], session_id=None,
+        )
+    )
+    assert decision["decision"] == "noop"
+    assert not calls  # no tool dispatched on noop
