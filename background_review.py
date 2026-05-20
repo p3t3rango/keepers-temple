@@ -7,7 +7,12 @@ unit-testable without mocking httpx.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
+from datetime import datetime, timezone
+
+import httpx
 
 
 # Hermes _SKILL_REVIEW_PROMPT port — preference order + do-not-capture list +
@@ -119,14 +124,11 @@ def restricted_tools() -> list:
     ]
 
 
-import logging
-import os
-from datetime import datetime, timezone
-
-import httpx
-
 logger = logging.getLogger(__name__)
 
+# Bounded timeout for the background fork (foreground uses unbounded). Prevents
+# a stalled review task from holding event-loop resources indefinitely.
+# Read at import-time, so set the env var BEFORE starting uvicorn.
 REVIEW_TIMEOUT_SECONDS = float(os.environ.get("KT_REVIEW_TIMEOUT", "120"))
 
 
@@ -152,7 +154,12 @@ async def _exec_tool_async(name: str, args: dict, wing: str, session_id):
 
 
 def _log_decision(rec: dict) -> None:
-    """Module-level shim so tests can monkeypatch the log seam."""
+    """Module-level shim so tests can monkeypatch the log seam.
+
+    `decision_log` doesn't import this module, so a top-level import would be
+    safe — but the shim keeps the seam unit-test-friendly without needing to
+    monkeypatch `decision_log.append` directly.
+    """
     import decision_log  # noqa: WPS433
     decision_log.append(rec)
 
@@ -213,10 +220,12 @@ async def run_skill_review(
         raw = ((r.json() or {}).get("message") or {}).get("content") or ""
         decision = parse_review_output(raw)
         dispatch = _dispatch_action(decision, wing, session_id)
+        dispatch_failed = False
         if dispatch is not None:
             try:
                 await _exec_tool_async(dispatch[0], dispatch[1], wing, session_id)
             except Exception:
+                dispatch_failed = True
                 logger.warning(
                     "review fork dispatch failed for %r", dispatch[0],
                     exc_info=True,
@@ -226,6 +235,7 @@ async def run_skill_review(
             "raw_review_output": raw,
             "decision": decision.get("decision", "noop"),
             "decision_payload": decision,
+            "dispatch_failed": dispatch_failed,
         })
         return decision
     except Exception as e:
