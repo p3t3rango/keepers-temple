@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Optional
 
 
 # Hermes _SKILL_REVIEW_PROMPT port — preference order + do-not-capture list +
@@ -50,13 +49,14 @@ Output STRICTLY one JSON object on a single line, no prose, no code fences:
 def wrap_input(
     transcript: str,
     wing: str,
-    loaded_skills: Optional[list] = None,
+    loaded_skills: list | None = None,
 ) -> str:
     """Structural-tag wrapper (gbrain think/prompt.ts port).
 
     Wrapping user content in fixed tags makes the parser-friendly + prevents
     prompt-injection-by-imperative inside transcripts.
     """
+    # Empty CSV (and the resulting empty tag) signals no skills were loaded.
     skills_csv = ", ".join(loaded_skills or [])
     return (
         f"<wing>{wing}</wing>\n"
@@ -65,6 +65,8 @@ def wrap_input(
     )
 
 
+# Matches flat JSON only (no nested objects). Weak local models rarely emit
+# nested-object literals in review output; bracket-counting parser is overkill.
 _JSON_BLOCK_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
 
 
@@ -75,6 +77,10 @@ def parse_review_output(raw: str) -> dict:
       1. Try whole-string json.loads.
       2. Fall back to the FIRST top-level {...} block found by regex.
       3. Return a no-op decision if nothing parses.
+
+    Trusts the model's enum compliance for `decision` (we only check the key
+    is present). Downstream dispatch (Task 4 _dispatch_action) gates on the
+    specific value, so an out-of-enum string degrades safely to no-op.
     """
     s = (raw or "").strip()
     if s:

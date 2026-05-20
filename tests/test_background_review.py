@@ -6,6 +6,8 @@ import tempfile
 
 import pytest
 
+# HOME patch must precede any import that transitively loads app.py (e.g. the
+# restricted_tools test below indirectly triggers an app import via late binding).
 _TMP_HOME = tempfile.mkdtemp(prefix="kt_review_")
 os.environ["HOME"] = _TMP_HOME
 os.environ["USERPROFILE"] = _TMP_HOME
