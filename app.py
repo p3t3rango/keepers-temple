@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import subprocess
@@ -47,6 +48,9 @@ from mempalace.palace import get_collection
 from mempalace.searcher import search_memories
 
 import mcp_client
+import skill_store
+
+logger = logging.getLogger(__name__)
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_ROOM = "general"
@@ -105,6 +109,8 @@ class ChatRequest(BaseModel):
     system_prompt: Optional[str] = None
     session_id: Optional[str] = None
     memory_limit: int = Field(default=5, ge=1, le=20)
+    use_skills: bool = True
+    skill_limit: int = Field(default=15, ge=1, le=50)
     persona: Optional[str] = None
     # Context window handling. When True, the server auto-summarizes older
     # message pairs before sending if the prompt would exceed
@@ -125,6 +131,24 @@ class WingRenameBody(BaseModel):
 
 class IdentityBody(BaseModel):
     text: str
+
+
+class SkillCreateBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    description: str = Field(..., min_length=1, max_length=2000)
+    body: str = Field(..., min_length=1, max_length=512_000)
+    category: str = Field("general", max_length=100)
+
+
+class SkillPatchBody(BaseModel):
+    old_string: str = Field(..., min_length=1, max_length=512_000)
+    new_string: str = Field(..., max_length=512_000)
+    file_path: Optional[str] = Field(None, max_length=500)
+    replace_all: bool = False
+
+
+class SkillPinBody(BaseModel):
+    pinned: bool
 
 
 class PersonaBody(BaseModel):
@@ -526,6 +550,21 @@ async def list_attachments(wing: str):
     }
 
 
+def _aggregate_palace(all_meta: list) -> tuple[dict, dict]:
+    """Count drawers per wing/room, excluding the internal kt-skills index
+    so it is never offered to the model/UI as a reusable memory topic."""
+    wings: dict[str, int] = {}
+    rooms: dict[str, int] = {}
+    for m in all_meta:
+        w = (m or {}).get("wing", "unknown")
+        if w == skill_store.SKILL_INDEX_WING:
+            continue
+        r = (m or {}).get("room", "unknown")
+        wings[w] = wings.get(w, 0) + 1
+        rooms[r] = rooms.get(r, 0) + 1
+    return wings, rooms
+
+
 @app.get("/api/stats")
 async def palace_stats():
     col = _safe_collection()
@@ -535,13 +574,7 @@ async def palace_stats():
         all_meta = col.get(include=["metadatas"]).get("metadatas") or []
     except Exception as e:
         return {"total": 0, "wings": {}, "rooms": {}, "error": str(e)}
-    wings: dict[str, int] = {}
-    rooms: dict[str, int] = {}
-    for m in all_meta:
-        w = (m or {}).get("wing", "unknown")
-        r = (m or {}).get("room", "unknown")
-        wings[w] = wings.get(w, 0) + 1
-        rooms[r] = rooms.get(r, 0) + 1
+    wings, rooms = _aggregate_palace(all_meta)
     try:
         total = col.count()
     except Exception:
@@ -1585,6 +1618,9 @@ async def get_wakeup(wing: Optional[str] = None):
     try:
         stack = MemoryStack(palace_path=PALACE_PATH)
         text = stack.wake_up(wing=wing)
+        skills_block = _format_skills_index(15)
+        if skills_block:
+            text = f"{text}\n\n{skills_block}"
         return {"text": text, "tokens_estimate": len(text) // 4, "wing": wing}
     except Exception as e:
         return {"text": "", "tokens_estimate": 0, "wing": wing, "error": str(e)}
@@ -1721,6 +1757,92 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_view",
+            "description": (
+                "Read the full body of a saved skill by name. Call this when a "
+                "skill in <available_skills> looks relevant before acting."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "file_path": {
+                        "type": "string",
+                        "description": "Optional support file inside the skill dir.",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_manage",
+            "description": (
+                "Create or improve a reusable skill (a written procedure you can "
+                "follow later). action='create' for a new skill; action='patch' "
+                "to fix/extend an existing one (token-efficient substring edit). "
+                "Prefer patching an existing skill over creating a near-duplicate. "
+                "Structure the body with these sections: '## Contract' (what it "
+                "guarantees), '## Phases' (numbered steps), '## Anti-Patterns' "
+                "(what to avoid), '## Output Format' (expected result)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["create", "patch"]},
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "body": {"type": "string"},
+                    "category": {"type": "string"},
+                    "triggers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Phrases that should surface this skill.",
+                    },
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Allow-list of tools this skill may drive.",
+                    },
+                    "mutating": {
+                        "type": "boolean",
+                        "description": "True if following the skill changes state.",
+                    },
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                },
+                "required": ["action", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "conversation_search",
+            "description": (
+                "Search PRIOR CHAT TRANSCRIPTS (past conversations with this "
+                "user) for relevant context. Distinct from memory_search "
+                "(saved facts + skills) — use this when you need what was "
+                "actually said in earlier sessions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "n": {"type": "integer",
+                          "description": "Max results 1-10 (default 5)."},
+                    "wing": {"type": "string",
+                             "description": "Optional wing to scope to."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 TOOL_PROTOCOL = (
@@ -1832,6 +1954,82 @@ def _exec_tool(
                 entry,
                 topic=str(args.get("topic") or "general"),
             )
+        if name == "skill_view":
+            sk_name = str(args.get("name") or "").strip()
+            if not sk_name:
+                return {"error": "name is required"}
+            try:
+                if args.get("file_path"):
+                    body = skill_store.read_skill_file(
+                        sk_name, str(args["file_path"])
+                    )
+                    return {"name": skill_store.slugify(sk_name),
+                            "file": str(args["file_path"]), "body": body}
+                sk = skill_store.get_skill(sk_name)
+            except skill_store.SkillError as e:
+                return {"error": str(e)}
+            return {"name": sk["name"], "description": sk["description"],
+                    "body": sk["body"], "state": sk["state"]}
+        if name == "skill_manage":
+            action = str(args.get("action") or "").strip()
+            try:
+                if action == "create":
+                    r = skill_store.create_skill(
+                        name=str(args.get("name") or ""),
+                        description=str(args.get("description") or ""),
+                        body=str(args.get("body") or ""),
+                        category=str(args.get("category") or "general"),
+                        agent_created=bool(args.get("agent_created", False)),
+                        triggers=args.get("triggers") or [],
+                        tools=args.get("tools") or [],
+                        mutating=bool(args.get("mutating", False)),
+                    )
+                    return {"ok": True, "name": r["name"], "action": "create"}
+                if action == "patch":
+                    old_s = str(args.get("old_string") or "")
+                    if not old_s:
+                        return {"error": "old_string is required for patch"}
+                    r = skill_store.patch_skill(
+                        name=str(args.get("name") or ""),
+                        old_string=old_s,
+                        new_string=str(args.get("new_string") or ""),
+                        file_path=args.get("file_path"),
+                        replace_all=bool(args.get("replace_all", False)),
+                    )
+                    return {"ok": True, "name": r["name"], "action": "patch"}
+                return {"error": f"unknown skill_manage action: {action}"}
+            except skill_store.SkillError as e:
+                return {"error": str(e)}
+        if name == "conversation_search":
+            q = str(args.get("query") or "").strip()
+            if not q:
+                return {"error": "query is required"}
+            # Default to all wings (None) — chat transcripts can span any wing
+            # the user has used, unlike memory_search which scopes to current.
+            wing = args.get("wing") or None
+            n = max(1, min(int(args.get("n", 5)), 10))
+            result = search_memories(
+                q, palace_path=PALACE_PATH, wing=wing, n_results=n * 3
+            )
+            hits = result.get("results", []) or []
+            convo = [
+                h for h in hits
+                if str(h.get("source_file") or "").startswith("chat://")
+            ][:n]
+            return {
+                "count": len(convo),
+                "hits": [
+                    {
+                        "wing": h.get("wing"),
+                        "room": h.get("room"),
+                        "similarity": h.get("similarity"),
+                        "text": (h.get("text") or "")[:600],
+                        "when": (str(h.get("source_file") or "")
+                                 .split("/")[-1] or None),
+                    }
+                    for h in convo
+                ],
+            }
         return {"error": f"unknown tool: {name}"}
     except Exception as e:
         return {"error": str(e)}
@@ -1951,6 +2149,60 @@ def _format_memory_block(hits: list[dict]) -> str:
         parts.append(f"\n[memory {i} | {wing}/{room} | similarity={sim}]\n{text}")
     parts.append("\n--- end memories ---")
     return "\n".join(parts)
+
+
+SKILLS_INDEX_CHAR_CAP = 2000  # ~600 tokens, hard ceiling for the skills block
+
+
+def _format_skills_index(limit: int) -> str:
+    """Compact <available_skills> block: name+description only, pinned first.
+
+    Best-effort: returns "" on any error or when there are no active skills.
+    Body is never included (progressive disclosure via the skill_view tool).
+    """
+    try:
+        skills = skill_store.list_skills(include_archived=False)
+    except Exception:
+        logger.warning("skills index: list_skills failed", exc_info=True)
+        return ""
+    if not skills:
+        return ""
+    skills.sort(key=lambda s: (not s.get("pinned"), s.get("category", ""),
+                               s.get("name", "")))
+    lines = []
+    used = 0
+    shown = 0
+    for s in skills:
+        if shown >= max(1, int(limit)):
+            break
+        line = f"- {s.get('name', '')}: {s.get('description', '')}"
+        if used + len(line) + 1 > SKILLS_INDEX_CHAR_CAP:
+            break
+        lines.append(line)
+        used += len(line) + 1
+        shown += 1
+    remaining = len(skills) - shown
+    if remaining > 0:
+        lines.append(f"… ({remaining} more skills; use skill_view to discover)")
+    body = "\n".join(lines)
+    return (
+        "<available_skills>\n"
+        f"{body}\n"
+        "Before replying, scan the skills above. If one is relevant or even "
+        "partially applies, you MUST load it with skill_view(name) before "
+        "acting. Do not guess a procedure a skill already documents.\n"
+        "</available_skills>"
+    )
+
+
+def _compose_skill_message(req: ChatRequest):
+    """Return the skills system-message dict, or None when disabled/empty."""
+    if not req.use_skills:
+        return None
+    block = _format_skills_index(req.skill_limit)
+    if not block:
+        return None
+    return {"role": "system", "content": block}
 
 
 async def _extract_kg_triples(model: str, transcript: str) -> list[dict]:
@@ -2101,6 +2353,10 @@ async def chat(req: ChatRequest):
     memory_block = _format_memory_block(memory_hits)
     if memory_block:
         out_messages.append({"role": "system", "content": memory_block})
+
+    skill_msg = _compose_skill_message(req)
+    if skill_msg is not None:
+        out_messages.append(skill_msg)
 
     chat_msgs: list[dict] = []
     for m in req.messages:
@@ -2389,6 +2645,77 @@ async def chat(req: ChatRequest):
         )
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.get("/api/skills")
+def api_skills_list(include_archived: bool = False):
+    items = skill_store.list_skills(include_archived=include_archived)
+    # derived=True: list was built by walking the filesystem (source of truth),
+    # not a cached manifest. Lets the UI flag rebuilt views (gbrain idea, §12).
+    return {
+        "skills": items,
+        "total": len([s for s in items if s["state"] == "active"]),
+        "derived": True,
+    }
+
+
+@app.get("/api/skills/{name}")
+def api_skill_get(name: str):
+    try:
+        return skill_store.get_skill(name)
+    except skill_store.SkillError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/skills")
+def api_skill_create(body: SkillCreateBody):
+    try:
+        return skill_store.create_skill(
+            name=body.name, description=body.description,
+            body=body.body, category=body.category)
+    except skill_store.SkillConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except skill_store.SkillError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/skills/{name}/patch")
+def api_skill_patch(name: str, body: SkillPatchBody):
+    try:
+        return skill_store.patch_skill(
+            name=name, old_string=body.old_string,
+            new_string=body.new_string, file_path=body.file_path,
+            replace_all=body.replace_all)
+    except skill_store.SkillNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except skill_store.SkillError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/skills/{name}/archive")
+def api_skill_archive(name: str):
+    try:
+        return skill_store.archive_skill(name)
+    except skill_store.SkillError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/skills/{name}/restore")
+def api_skill_restore(name: str):
+    try:
+        return skill_store.restore_skill(name)
+    except skill_store.SkillConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except skill_store.SkillError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/skills/{name}/pin")
+def api_skill_pin(name: str, body: SkillPinBody):
+    try:
+        return skill_store.set_pinned(name, body.pinned)
+    except skill_store.SkillError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

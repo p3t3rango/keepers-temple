@@ -1,0 +1,2 @@
+# requirements-dev.txt — test-only deps (not needed at runtime)
+pytest>=7.4
