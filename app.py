@@ -48,6 +48,7 @@ from mempalace.palace import get_collection
 from mempalace.searcher import search_memories
 
 import mcp_client
+import nudge_state
 import skill_store
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,9 @@ class ChatRequest(BaseModel):
     memory_limit: int = Field(default=5, ge=1, le=20)
     use_skills: bool = True
     skill_limit: int = Field(default=15, ge=1, le=50)
+    review_fork: bool = True
+    creation_nudge_interval: int = Field(default=15, ge=0, le=200)
+    memory_nudge_interval: int = Field(default=10, ge=0, le=200)
     persona: Optional[str] = None
     # Context window handling. When True, the server auto-summarizes older
     # message pairs before sending if the prompt would exceed
@@ -1845,6 +1849,180 @@ TOOLS = [
     },
 ]
 
+
+# ─── Nudge counters (Plan 3 background-review fork triggers) ────────────────
+
+
+def _nudge_bump(wing: str, key: str) -> int:
+    """Thin wrapper so tests can monkeypatch."""
+    try:
+        return nudge_state.bump(wing, key)
+    except Exception:
+        logger.warning("nudge bump failed (%s/%s)", wing, key, exc_info=True)
+        return 0
+
+
+def _nudge_bump_by(wing: str, key: str, n: int) -> int:
+    """Thin wrapper so tests can monkeypatch."""
+    try:
+        return nudge_state.bump_by(wing, key, n)
+    except Exception:
+        logger.warning(
+            "nudge bump_by failed (%s/%s, n=%s)", wing, key, n, exc_info=True
+        )
+        return 0
+
+
+def _nudge_reset(wing: str, key: str) -> None:
+    """Thin wrapper so tests can monkeypatch."""
+    try:
+        nudge_state.reset(wing, key)
+    except Exception:
+        logger.warning("nudge reset failed (%s/%s)", wing, key, exc_info=True)
+
+
+def _should_count_skill_iter(combined_tools: list) -> bool:
+    """Only count tool-iters when skill_manage is in the offered toolset."""
+    return any(
+        (t.get("function") or {}).get("name") == "skill_manage"
+        for t in combined_tools or []
+    )
+
+
+def _detect_writes_in_tool_results(results: list) -> dict:
+    """Inspect tool_result payloads to decide which nudge counter to reset.
+
+    Verified against `_exec_tool`/`_exec_tool_async` (grep `if name == "skill_manage"`,
+    `if name == "diary_write"`):
+      * skill_manage(create|patch) -> {"ok": True, "name": ..., "action": "create"|"patch"}
+        (archive/restore are HTTP-only via /api/skills/{name}/{action}, NOT chat
+        tools, so they cannot appear here.)
+      * diary_write (tool_add_drawer) -> {"success": True, "drawer_id": ..., "wing": ..., "room": ...}
+    """
+    skill_write = False
+    memory_write = False
+    for r in results or []:
+        if not isinstance(r, dict):
+            continue
+        if r.get("ok") and r.get("action") in ("create", "patch"):
+            skill_write = True
+        if r.get("success") and r.get("drawer_id"):
+            memory_write = True
+    return {"skill": skill_write, "memory": memory_write}
+
+
+def _record_post_turn_counters(
+    *,
+    wing: str,
+    tool_iter_count: int,
+    tool_results: list,
+    is_user_turn: bool,
+) -> None:
+    """Update nudge counters after a chat turn completes.
+
+    Caller is responsible for filtering tool_iter_count by _should_count_skill_iter
+    (i.e. pass 0 when skill_manage wasn't offered).
+    """
+    writes = _detect_writes_in_tool_results(tool_results)
+    if writes["skill"]:
+        _nudge_reset(wing, "iters_since_skill")
+    else:
+        n = max(0, int(tool_iter_count))
+        if n > 0:
+            _nudge_bump_by(wing, "iters_since_skill", n)
+    if is_user_turn:
+        if writes["memory"]:
+            _nudge_reset(wing, "turns_since_memory")
+        else:
+            _nudge_bump(wing, "turns_since_memory")
+
+
+def _nudge_load(wing: str) -> dict:
+    """Thin wrapper so tests can monkeypatch."""
+    try:
+        return nudge_state.load(wing)
+    except Exception:
+        return {"iters_since_skill": 0, "turns_since_memory": 0}
+
+
+def _spawn_review_fork(*, model: str, transcript: str, wing: str,
+                       loaded_skills: list, session_id) -> None:
+    """Fire-and-forget background task; all exceptions swallowed."""
+    import background_review
+
+    async def _runner():
+        try:
+            await background_review.run_skill_review(
+                model=model, transcript=transcript, wing=wing,
+                loaded_skills=loaded_skills, session_id=session_id,
+            )
+        except Exception:
+            logger.warning("review fork errored", exc_info=True)
+
+    # Fire-and-forget: CPython holds the task alive via the event-loop registry
+    # for the duration of the running loop, so no strong-reference set is needed
+    # here. The RuntimeError catch is specifically for "no running event loop"
+    # at import-time / synchronous test contexts; other RuntimeErrors (e.g.
+    # cross-loop attachment) would indicate a real bug and should propagate —
+    # but in fire-and-forget, we accept silent skip as the safer default.
+    try:
+        asyncio.create_task(_runner())
+    except RuntimeError:
+        pass
+
+
+def _maybe_spawn_fork(
+    *,
+    wing: str,
+    model: str,
+    transcript: str,
+    loaded_skills: list,
+    session_id,
+    creation_nudge_interval: int,
+    memory_nudge_interval: int,
+    review_enabled: bool,
+) -> None:
+    """Threshold-check + at-most-one-spawn-per-turn gate."""
+    if not review_enabled:
+        return
+    counters = _nudge_load(wing)
+    skill_trip = (
+        creation_nudge_interval > 0
+        and counters.get("iters_since_skill", 0) >= creation_nudge_interval
+    )
+    memory_trip = (
+        memory_nudge_interval > 0
+        and counters.get("turns_since_memory", 0) >= memory_nudge_interval
+    )
+    if not (skill_trip or memory_trip):
+        return
+    _spawn_review_fork(
+        model=model, transcript=transcript, wing=wing,
+        loaded_skills=loaded_skills, session_id=session_id,
+    )
+
+
+def _review_enabled_for_request(per_request: bool) -> bool:
+    """Env override beats per-request opt-in (operator kill switch)."""
+    if os.environ.get("KT_REVIEW_FORK", "1").strip() in ("0", "false", "False"):
+        return False
+    return bool(per_request)
+
+
+def _default_creation_nudge_interval() -> int:
+    try:
+        return max(0, int(os.environ.get("KT_CREATION_NUDGE_INTERVAL", "15")))
+    except ValueError:
+        return 15
+
+
+def _default_memory_nudge_interval() -> int:
+    try:
+        return max(0, int(os.environ.get("KT_MEMORY_NUDGE_INTERVAL", "10")))
+    except ValueError:
+        return 10
+
+
 TOOL_PROTOCOL = (
     "You have tools available. Use them proactively:\n"
     "- BEFORE answering about the user's past (preferences, people, projects, "
@@ -2191,6 +2369,9 @@ def _format_skills_index(limit: int) -> str:
         "Before replying, scan the skills above. If one is relevant or even "
         "partially applies, you MUST load it with skill_view(name) before "
         "acting. Do not guess a procedure a skill already documents.\n"
+        "If a loaded skill is wrong, stale, or incomplete, patch it in-turn "
+        "with skill_manage(action='patch', name, old_string, new_string) — "
+        "do not wait for the background reviewer.\n"
         "</available_skills>"
     )
 
@@ -2370,6 +2551,13 @@ async def chat(req: ChatRequest):
     out_messages.extend(chat_msgs)
 
     async def generate():
+        # Hoisted for the post-turn counter recorder (Task 6) and the
+        # background-review fork spawn (Task 7) — must survive both the
+        # `enable_tools` branch and the `save_to_memory` branch.
+        tool_iters: int = 0
+        tool_results_collected: list[dict] = []
+        combined_tools: list[dict] = []
+        transcript: str = ""
         meta = {
             "type": "memory_hits",
             "wing": wing,
@@ -2483,6 +2671,7 @@ async def chat(req: ChatRequest):
                             result = await _exec_tool_async(
                                 name, raw_args, wing, req.session_id
                             )
+                            tool_results_collected.append(result)
                             yield (
                                 "data: "
                                 + json.dumps(
@@ -2501,6 +2690,7 @@ async def chat(req: ChatRequest):
                                     "content": json.dumps(result),
                                 }
                             )
+                        tool_iters += 1
                     else:
                         # Hit iteration cap
                         yield (
@@ -2629,6 +2819,50 @@ async def chat(req: ChatRequest):
                             kg_added.append(t)
                     except Exception:
                         continue
+
+        try:
+            _record_post_turn_counters(
+                wing=wing,
+                tool_iter_count=(
+                    tool_iters
+                    if req.enable_tools
+                    and _should_count_skill_iter(combined_tools)
+                    else 0
+                ),
+                tool_results=(
+                    tool_results_collected if req.enable_tools else []
+                ),
+                is_user_turn=True,
+            )
+        except Exception:
+            logger.warning(
+                "post-turn counter recording failed", exc_info=True
+            )
+
+        try:
+            loaded_skill_names: list[str] = []
+            if req.use_skills:
+                try:
+                    loaded_skill_names = [
+                        s["name"]
+                        for s in skill_store.list_skills(include_archived=False)[
+                            : req.skill_limit
+                        ]
+                    ]
+                except Exception:
+                    loaded_skill_names = []
+            _maybe_spawn_fork(
+                wing=wing,
+                model=req.model,
+                transcript=transcript,
+                loaded_skills=loaded_skill_names,
+                session_id=req.session_id,
+                creation_nudge_interval=req.creation_nudge_interval,
+                memory_nudge_interval=req.memory_nudge_interval,
+                review_enabled=_review_enabled_for_request(req.review_fork),
+            )
+        except Exception:
+            logger.warning("review fork gate failed", exc_info=True)
 
         yield (
             "data: "

@@ -151,3 +151,16 @@ def test_conversation_search_clamps_n_to_ten(monkeypatch):
         "conversation_search", {"query": "x", "n": 50}, "personal", None
     )
     assert res["count"] == 10
+
+
+def test_compose_skill_message_includes_inline_patch_hint():
+    ss.create_skill(name="hp", description="d", body="b\n")
+    msg = app_module._compose_skill_message(_req(use_skills=True))
+    assert "If a loaded skill is wrong" in msg["content"]
+    assert "skill_manage" in msg["content"]
+    assert "patch" in msg["content"]
+
+
+def test_compose_skill_message_omits_hint_when_no_skills():
+    # No skills => no message at all => hint trivially absent.
+    assert app_module._compose_skill_message(_req(use_skills=True)) is None
